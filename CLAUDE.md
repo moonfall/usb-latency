@@ -100,6 +100,23 @@ pio run -t upload   # flash (see esptool gotcha below)
   (`USB.productName()`, `USB.VID()`, HID device construction, etc.) must
   happen in `setup()`, in a sketch that fully owns when `USB.begin()` is
   called — which requires this flag to stay `0`.
+- **A mode-switch reboot must wait for BOOT to be released first.**
+  GPIO0 (the BOOT button) is also the ESP32's boot-mode strapping pin: if
+  it's still held low at the instant `esp_restart()` resets the chip, the
+  ROM bootloader reads that as "enter USB/UART download mode" instead of
+  booting this firmware — so the device never re-enumerates as anything
+  HID at all (it silently drops into the download bootloader). Since the
+  3s-hold mode switch fires *while the button is still down by
+  definition*, `switchModeAndReboot()` was calling `ESP.restart()` before
+  the user had physically released the button — timing-dependent on how
+  fast they let go, which made it look like a flaky, mode-specific bug
+  (worked twice, then didn't) rather than what it was: this hazard on
+  every single mode-switch reboot. Fixed by blocking in
+  `switchModeAndReboot()` on `digitalRead(BOOT_BUTTON_PIN) == LOW` (plus a
+  short settle delay) before calling `ESP.restart()`. This is the same
+  underlying hazard as the "don't hold BOOT while plugging in" note
+  above, just self-inflicted via software reset instead of a physical
+  power-up.
 - **Local esptool/PlatformIO toolchain is broken on this machine**: `pio
   run -t upload` (and any build step needing `esptool`, e.g. building
   `bootloader.bin`) fails — `tool-esptoolpy` package install errors

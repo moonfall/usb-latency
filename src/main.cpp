@@ -153,8 +153,20 @@ static void switchModeAndReboot() {
   prefs.putUChar(PREFS_KEY, next);
   prefs.end();
 
-  setPixel(40, 40, 40);  // brief white flash: hold registered, rebooting
-  delay(150);
+  setPixel(40, 40, 40);  // white flash: hold registered, waiting for release
+
+  // GPIO0 is also the chip's boot-mode strapping pin: if it's still held
+  // low (pressed) at the instant esp_restart() resets the chip, the ROM
+  // bootloader reads that as "enter USB/UART download mode" instead of
+  // booting this firmware — so it never re-enumerates as anything HID at
+  // all. Wait for the physical release, plus a settle margin, before
+  // rebooting.
+  while (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+    delay(5);
+  }
+  delay(50);
+
+  setPixel(0, 0, 0);
   ESP.restart();
 }
 
