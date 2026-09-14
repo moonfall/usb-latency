@@ -302,3 +302,17 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   layer flips at runtime (`boardToggleMeter()`, no USB involvement, HID
   reports and measurements carry on underneath it). If something new needs
   switching, the first question is which of those two it is.
+- **The AtomS3R has no usable RGB status LED — don't try to add one.**
+  Confirmed on hardware after a failed attempt. The docs' pin map lists
+  "LP5562 (RGB Driver)" on the internal I2C bus, which reads like there's
+  an addressable status LED behind it, and the chip *is* there — M5GFX
+  drives the LCD backlight through it on the W channel (register 0x0E),
+  which works. But the R/G/B channels (registers 0x04/0x03/0x02) reach
+  nothing accessible on this board: bringing them up exactly as M5GFX
+  brings up W — the chip is already enabled, clocked, and has LED_MAP = 0
+  putting every channel under direct PWM control, so it is only a register
+  write per channel — produces no visible light. Whatever the reason
+  (unpopulated, or not wired out), there is nothing to drive. The only
+  press indicator on this board is the on-screen action box, and note that
+  it can't repaint until runMeasurement() returns.
+
