@@ -1,0 +1,172 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>USB Latency Test Target</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    font-family: system-ui, sans-serif;
+  }
+  /* No transition, ever: a fade would smear the colour change over time
+     and the light sensor would see a slow ramp instead of a hard edge,
+     corrupting the very thing being measured. */
+  #stage {
+    width: 100vw;
+    height: 100vh;
+    background: #202020;
+    transition: none;
+  }
+  #panel {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #card {
+    background: #fff;
+    color: #111;
+    padding: 24px 32px;
+    border-radius: 10px;
+    max-width: 520px;
+    box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+  }
+  #card h1 { font-size: 18px; margin: 0 0 12px; }
+  #card p { font-size: 14px; line-height: 1.5; margin: 8px 0; }
+  #card button {
+    font-size: 15px;
+    padding: 8px 16px;
+    margin: 4px 8px 4px 0;
+    cursor: pointer;
+  }
+  #status { font-size: 13px; color: #444; margin-top: 12px; }
+  #status div { margin: 2px 0; }
+  #corner {
+    position: fixed;
+    right: 6px;
+    bottom: 6px;
+    font-size: 11px;
+    color: #888;
+    font-family: monospace;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="panel">
+    <div id="card">
+      <h1>USB Latency Test Target</h1>
+      <p>Flips this screen between dark grey and white on a gamepad
+         button, Space, or a left click — whichever your device is
+         currently emulating. Point the light sensor at the stage,
+         then press Start.</p>
+      <p><b>Keyboard and mouse can't be told apart from your own.</b>
+         The browser has no way to know an input came from the test
+         device rather than your real keyboard/trackpad — avoid
+         touching either while testing those modes. Gamepad input
+         <i>can</i> be filtered by device name (see below).</p>
+      <button id="startBtn">Start</button>
+      <button id="fullscreenBtn">Fullscreen</button>
+      <button id="flipBtn">Flip now (sanity check)</button>
+      <div id="status">
+        <div id="gpStatus">Gamepad: none connected yet</div>
+        <div id="counts">Toggles — gamepad: 0, keyboard: 0, mouse: 0</div>
+        <div>Press <b>O</b> at any time to show/hide this panel.</div>
+      </div>
+    </div>
+  </div>
+  <div id="corner"></div>
+</div>
+<script>
+(function () {
+  const stage = document.getElementById('stage');
+  const panel = document.getElementById('panel');
+  const corner = document.getElementById('corner');
+  const gpStatus = document.getElementById('gpStatus');
+  const counts = document.getElementById('counts');
+
+  let white = false;
+  const n = { gamepad: 0, keyboard: 0, mouse: 0 };
+
+  function toggle(source) {
+    white = !white;
+    stage.style.background = white ? '#ffffff' : '#202020';
+    n[source]++;
+    counts.textContent =
+      'Toggles — gamepad: ' + n.gamepad +
+      ', keyboard: ' + n.keyboard +
+      ', mouse: ' + n.mouse;
+    corner.textContent = n.gamepad + 'g ' + n.keyboard + 'k ' + n.mouse + 'm';
+  }
+
+  function setOverlayVisible(visible) {
+    panel.style.display = visible ? 'flex' : 'none';
+  }
+
+  document.getElementById('startBtn').addEventListener('click', function () {
+    setOverlayVisible(false);
+    // Attached only now: a click starts as a mousedown too, and attaching
+    // the mousedown listener here — after that mousedown already fired —
+    // means this same click can't immediately flip the stage.
+    document.addEventListener('mousedown', function (e) {
+      if (e.button === 0) toggle('mouse');
+    });
+  });
+
+  document.getElementById('flipBtn').addEventListener('click', function () {
+    toggle('mouse');
+  });
+
+  document.getElementById('fullscreenBtn').addEventListener('click', function () {
+    document.documentElement.requestFullscreen().catch(function () {});
+  });
+
+  window.addEventListener('keydown', function (e) {
+    if (e.key === 'o' || e.key === 'O') {
+      setOverlayVisible(panel.style.display === 'none');
+      return;
+    }
+    if (e.code === 'Space') {
+      e.preventDefault();
+      if (e.repeat) return;  // OS key-repeat while held — one toggle per press, not per repeat
+      toggle('keyboard');
+    }
+  });
+
+  // Gamepad API has no button-press event; it has to be polled. Track
+  // each gamepad's previous button states so a toggle fires once on the
+  // rising edge (unpressed -> pressed), not for as long as the button
+  // stays down.
+  const prevPressed = {};
+
+  function pollGamepads() {
+    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+    let connectedNames = [];
+    for (let i = 0; i < pads.length; i++) {
+      const pad = pads[i];
+      if (!pad) continue;
+      connectedNames.push(pad.id);
+
+      const prev = prevPressed[i] || [];
+      for (let b = 0; b < pad.buttons.length; b++) {
+        const isDown = pad.buttons[b].pressed;
+        if (isDown && !prev[b]) toggle('gamepad');
+        prev[b] = isDown;
+      }
+      prevPressed[i] = prev;
+    }
+    gpStatus.textContent = connectedNames.length
+      ? 'Gamepad: ' + connectedNames.join(', ')
+      : 'Gamepad: none connected yet (press its button once — browsers ' +
+        'only report a gamepad after its first input)';
+    requestAnimationFrame(pollGamepads);
+  }
+  requestAnimationFrame(pollGamepads);
+})();
+</script>
+</body>
+</html>
