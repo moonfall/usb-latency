@@ -1,29 +1,50 @@
 /*
- * ESP32-S3-Zero USB HID Gamepad / Keyboard / Mouse (single active device)
+ * USB HID Gamepad / Keyboard / Mouse (single active device)
  * -------------------------------------------------------------------------
  * Emulates exactly ONE USB HID device at a time — gamepad ("X" button),
- * keyboard (Space), or mouse (left click) — selected by the onboard BOOT
- * button (GPIO0, active-low):
+ * keyboard (Space), or mouse (left click) — selected by the board's one
+ * button:
  *   - Short press: send the active mode's action.
- *   - Hold for MODE_HOLD_MS (3s): switch to the next mode
- *     (gamepad -> keyboard -> mouse -> gamepad) and re-enumerate on USB.
+ *   - Hold for MODE_HOLD_MS (3s): select the next mode
+ *     (gamepad -> keyboard -> mouse -> gamepad) as "pending" and persist
+ *     it to NVS — this does NOT reboot or change what's active this
+ *     session. Keep holding to cycle through further modes, one per
+ *     MODE_HOLD_MS. A manual reboot (reset button, or unplug/replug) is
+ *     required for the pending mode to actually take effect.
  *
- * Why a reboot, not a runtime switch: the ESP32 Arduino core's TinyUSB HID
- * wrapper registers a device's report descriptor once, in that device
- * class's *constructor* (USBHIDGamepad::USBHIDGamepad() etc. all call
- * hid.addDevice(this, ...) unconditionally) — merely skipping .begin() on
- * the other two doesn't stop them contributing their report collection to
- * the composite descriptor. Constructing all three, like a normal
- * composite-HID sketch does, is exactly what made the device enumerate as
- * a multi-collection gadget (which macOS then splits into what look like
- * several devices). To present as a single, genuine gamepad *or* keyboard
- * *or* mouse, only the active mode's class must ever be constructed —
- * which this sketch does by `new`-ing only one of them, at runtime, based
- * on a mode persisted in NVS (`Preferences`). Switching modes therefore
- * means: persist the new mode, then `ESP.restart()`. The reboot's USB PHY
- * disconnect/reconnect is what makes the mode switch look like a real
- * hot-plug to a different device, rather than a live descriptor change
- * (which this core's HID wrapper has no supported way to do anyway).
+ * Two boards are supported, one PlatformIO env each. Everything specific
+ * to a board — which pin the button is on, and how state is shown — lives
+ * behind board.h, with exactly one board_*.cpp compiled per env:
+ *
+ *   env:esp32-s3-zero    Waveshare ESP32-S3-Zero. BOOT button (GPIO0);
+ *                        the mode shows as a colour on the onboard WS2812,
+ *                        briefly at boot and while the button is held.
+ *   env:m5stack-atoms3r  M5Stack AtomS3R. Screen button (GPIO41); the mode
+ *                        is shown permanently on the 128x128 LCD.
+ *
+ * Nothing below this point is board-specific, and nothing in board_*.cpp
+ * touches USB.
+ *
+ * Why a reboot at all, and why it must be manual: the ESP32 Arduino
+ * core's TinyUSB HID wrapper registers a device's report descriptor
+ * once, in that device class's *constructor* (USBHIDGamepad::USBHIDGamepad()
+ * etc. all call hid.addDevice(this, ...) unconditionally) — merely
+ * skipping .begin() on the other two doesn't stop them contributing their
+ * report collection to the composite descriptor. Constructing all three,
+ * like a normal composite-HID sketch does, is exactly what made the
+ * device enumerate as a multi-collection gadget (which macOS then splits
+ * into what look like several devices). To present as a single, genuine
+ * gamepad *or* keyboard *or* mouse, only the active mode's class must
+ * ever be constructed — which this sketch does by `new`-ing only one of
+ * them, at boot, based on the mode persisted in NVS (`Preferences`). That
+ * choice can't be changed without re-running setup() from scratch, i.e.
+ * a reboot. An earlier version called `ESP.restart()` automatically once
+ * a hold crossed the threshold, but on the S3-Zero GPIO0 doubles as the
+ * chip's boot-mode strapping pin: since the hold-to-switch gesture means
+ * the button is, by definition, still held down at that instant, the
+ * reboot frequently landed the chip in the ROM download bootloader
+ * instead of back in this firmware. Requiring a manual reboot — at a time
+ * the user chooses, button released — sidesteps that hazard entirely.
  *
  * This also means every USB identity/descriptor call (constructing the
  * one HID device, USB.productName(), etc.) MUST happen in setup(), before
@@ -32,29 +53,23 @@
  * gotcha): with it set to 1, the Arduino core's app_main() calls
  * USB.begin() itself before setup() ever runs, locking in a USB
  * descriptor that doesn't know about our HID device or product name at
- * all — which is why, with that flag on, none of the HID actions
- * (button/keypress/click) ever reached the host, even though everything
- * that doesn't depend on USB enumeration (LED, NVS-persisted mode) looked
- * fine. With CDC_ON_BOOT off, `USBSerial` below is begun manually instead,
+ * all. With CDC_ON_BOOT off, `USBSerial` below is begun manually instead,
  * so Serial-style debug output over USB remains available.
  *
  * The USB product name includes the active mode (see modeProductName()),
  * so the host's device picker/System Information shows e.g. "USB Latency
- * Tester - Keyboard" rather than a generic, mode-less name.
- *
- * The onboard WS2812 RGB LED (GPIO21) lights up in a colour identifying
- * the active mode while the button is held — red/green/blue — and
- * briefly flashes white just before a mode-switch reboot.
+ * Tester - Keyboard" rather than a generic, mode-less name. It only
+ * updates after a reboot, same as the mode itself.
  *
  * Debounce strategy: leading-edge / "lockout" debounce (act immediately
  * on the edge, then ignore further changes for DEBOUNCE_MS) to keep
- * added latency at zero for the actual button action; only the reboot
- * path is deliberately slow.
+ * added latency at zero for the actual button action; only the
+ * mode-cycling feedback is deliberately slow. For the same reason, the
+ * HID report is always sent before any board feedback is drawn, so
+ * lighting an LED or repainting a screen is never in the latency path.
  *
  * Requires ARDUINO_USB_MODE=0 (native USB-OTG / TinyUSB) — set in
- * platformio.ini. Do not press/hold BOOT while plugging in via a normal
- * (non-flashing) USB session; that combination is reserved for entering
- * the ROM bootloader.
+ * platformio.ini.
  */
 
 #include <Arduino.h>
@@ -65,24 +80,19 @@
 #include <USBHIDKeyboard.h>
 #include <USBHIDMouse.h>
 
+#include "board.h"
+#include "mode.h"
+
 // --- Configuration ---------------------------------------------------
-static const uint8_t BOOT_BUTTON_PIN = 0;      // GPIO0 on the S3-Zero
-static const uint8_t RGB_LED_PIN = 21;         // onboard WS2812
-static const uint32_t DEBOUNCE_MS = 25;        // lockout window after a trigger
-static const uint32_t MODE_HOLD_MS = 3000;     // hold time to cycle modes
+static const uint32_t DEBOUNCE_MS = 25;     // lockout window after a trigger
+static const uint32_t MODE_HOLD_MS = 3000;  // hold time per mode-cycle step
 
 static const char *PREFS_NAMESPACE = "usbmode";
 static const char *PREFS_KEY = "mode";
 
-enum Mode : uint8_t {
-  MODE_GAMEPAD = 0,
-  MODE_KEYBOARD,
-  MODE_MOUSE,
-  MODE_COUNT,
-};
-
 static Preferences prefs;
-static Mode activeMode = MODE_GAMEPAD;
+static Mode activeMode = MODE_GAMEPAD;   // mode this boot actually enumerated as
+static Mode pendingMode = MODE_GAMEPAD;  // mode a reboot would pick up; dialed in by holding
 
 // Manual CDC serial (see file header on why ARDUINO_USB_CDC_ON_BOOT is 0).
 static USBCDC USBSerial;
@@ -93,40 +103,10 @@ static USBHIDGamepad *gamepad = nullptr;
 static USBHIDKeyboard *keyboard = nullptr;
 static USBHIDMouse *mouse = nullptr;
 
-static const char *modeProductName(Mode mode) {
-  switch (mode) {
-    case MODE_GAMEPAD:  return "USB Latency Tester - Gamepad";
-    case MODE_KEYBOARD: return "USB Latency Tester - Keyboard";
-    case MODE_MOUSE:    return "USB Latency Tester - Mouse";
-    default:            return "USB Latency Tester";
-  }
-}
-
 static bool stableState = false;   // false = released, true = pressed
 static uint32_t lastTriggerMs = 0;
-static uint32_t pressStartMs = 0;
-
-// This board's onboard WS2812 shows red where rgbLedWrite()'s green_val
-// argument is nonzero and green where its red_val argument is nonzero —
-// i.e. its red/green channels are swapped relative to the library's
-// assumed wire order. blue_val is unaffected. Swap red/green here so
-// every other call site can use normal, intuitive (r, g, b) values.
-static inline void setPixel(uint8_t r, uint8_t g, uint8_t b) {
-  rgbLedWrite(RGB_LED_PIN, g, r, b);
-}
-
-static inline void setLed(bool on) {
-  if (!on) {
-    setPixel(0, 0, 0);
-    return;
-  }
-  switch (activeMode) {
-    case MODE_GAMEPAD:  setPixel(40, 0, 0); break;  // red
-    case MODE_KEYBOARD: setPixel(0, 40, 0); break;  // green
-    case MODE_MOUSE:    setPixel(0, 0, 40); break;  // blue
-    default: break;
-  }
-}
+static uint32_t nextCycleMs = 0;   // when the current hold next advances pendingMode
+static bool cycledThisHold = false;  // true once this hold has advanced the mode at least once
 
 static inline void sendPress() {
   switch (activeMode) {
@@ -146,36 +126,23 @@ static inline void sendRelease() {
   }
 }
 
-// Persists the next mode and reboots so the device re-enumerates on USB
-// as that mode's device alone — a real hot-plug, not a live switch.
-static void switchModeAndReboot() {
-  Mode next = static_cast<Mode>((activeMode + 1) % MODE_COUNT);
-  prefs.putUChar(PREFS_KEY, next);
-  prefs.end();
+// Advances pendingMode by one and persists it — takes effect on the next
+// manual reboot, not this session.
+static void advancePendingMode() {
+  pendingMode = static_cast<Mode>((pendingMode + 1) % MODE_COUNT);
+  prefs.putUChar(PREFS_KEY, pendingMode);
 
-  setPixel(40, 40, 40);  // white flash: hold registered, waiting for release
-
-  // GPIO0 is also the chip's boot-mode strapping pin: if it's still held
-  // low (pressed) at the instant esp_restart() resets the chip, the ROM
-  // bootloader reads that as "enter USB/UART download mode" instead of
-  // booting this firmware — so it never re-enumerates as anything HID at
-  // all. Wait for the physical release, plus a settle margin, before
-  // rebooting.
-  while (digitalRead(BOOT_BUTTON_PIN) == LOW) {
-    delay(5);
-  }
-  delay(50);
-
-  setPixel(0, 0, 0);
-  ESP.restart();
+  boardShowPending(activeMode, pendingMode, !cycledThisHold);
+  cycledThisHold = true;
 }
 
 void setup() {
-  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  boardBegin();
 
   prefs.begin(PREFS_NAMESPACE, false);
   uint8_t stored = prefs.getUChar(PREFS_KEY, MODE_GAMEPAD);
   activeMode = (stored < MODE_COUNT) ? static_cast<Mode>(stored) : MODE_GAMEPAD;
+  pendingMode = activeMode;
 
   // Construct the one active-mode device, and set the product name to
   // match, before USB.begin() — both are rejected as no-ops afterwards.
@@ -189,11 +156,12 @@ void setup() {
   USBSerial.begin();
   USB.begin();
 
-  setLed(false);
+  // Only now that USB is up is it safe to spend time on the indicator.
+  boardShowBoot(activeMode, pendingMode);
 }
 
 void loop() {
-  bool raw = (digitalRead(BOOT_BUTTON_PIN) == LOW);  // active-low
+  bool raw = boardButtonPressed();
   uint32_t now = millis();
 
   // Outside the lockout window, any change is a real edge: act on it
@@ -202,19 +170,22 @@ void loop() {
     stableState = raw;
     lastTriggerMs = now;
 
+    // HID report first, feedback second — never the other way round.
     if (stableState) {
-      pressStartMs = now;
       sendPress();
-      setLed(true);
+      nextCycleMs = now + MODE_HOLD_MS;
+      cycledThisHold = false;
     } else {
       sendRelease();
-      setLed(false);
     }
+    boardShowPress(stableState, activeMode);
   }
 
-  // A long-press cycles to the next mode via a reboot (see file header).
-  if (stableState && (now - pressStartMs) >= MODE_HOLD_MS) {
-    sendRelease();
-    switchModeAndReboot();  // never returns
+  // A hold advances pendingMode one step per MODE_HOLD_MS, for as long as
+  // the button stays down — see file header for why this only selects a
+  // mode for the next manual reboot, rather than switching live.
+  if (stableState && now >= nextCycleMs) {
+    advancePendingMode();
+    nextCycleMs = now + MODE_HOLD_MS;
   }
 }
