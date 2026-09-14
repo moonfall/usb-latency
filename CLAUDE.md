@@ -130,9 +130,12 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   unyielding (`analogRead()` is tens of µs, so it resolves far finer than
   a millisecond), bounded by `MEASURE_TIMEOUT_MS` (500ms) — see the
   core-0-starvation gotcha below. The top strip shows the last figure plus
-  a running count/min/mean, unless the meter view is up — measurements run
-  and accumulate either way, so switching back shows the stats they built
-  while you were aiming.
+  the count and mean for each direction of crossing (rise/fall through
+  `LIGHT_THRESHOLD`), kept as two separate populations rather than one
+  pooled average, unless the meter view is up — measurements run and
+  accumulate either way, so switching back shows the stats they built
+  while you were aiming. See the direction-bucketing gotcha below for why
+  they're split.
 
 ## Gotchas already hit
 
@@ -315,4 +318,21 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   (unpopulated, or not wired out), there is nothing to drive. The only
   press indicator on this board is the on-screen action box, and note that
   it can't repaint until runMeasurement() returns.
-
+- **Latency stats are kept as two populations, R and F, not one pooled
+  average.** `runMeasurement()` already knows which way the ADC crossed
+  the threshold (`waitForRise`, needed anyway to support both a
+  dark-to-light and a light-to-dark change off the one threshold value —
+  see the direction-inference comment on that function). Bucketing by that
+  same flag rather than discarding it after use is deliberate: a
+  photoresistor does not generally respond at the same speed getting
+  brighter as it does getting dimmer, so a pooled average of both
+  directions can look bimodal for a reason that has nothing to do with
+  the thing being measured. Splitting the stats turns "is this bimodal"
+  from a guess into something you can just read off the screen — if R and
+  F have visibly different means, that's the sensor; if they're the same
+  and each is *individually* bimodal, look at the display's refresh
+  timing instead. Which of R (rise) or F (fall) is your display's
+  dark→light vs light→dark isn't asserted anywhere in the firmware — it
+  depends on the specific photoresistor circuit's polarity, which hasn't
+  been characterized here. Read it off the meter view: watch which way the
+  bar moves for a known transition.
