@@ -12,6 +12,16 @@ tree:
 | `esp32-s3-zero` | Waveshare ESP32-S3-Zero | BOOT button (GPIO0) | onboard WS2812 (GPIO21) |
 | `m5stack-atoms3r` | M5Stack AtomS3R | screen button (GPIO41) | 128x128 LCD |
 
+The AtomS3R variant also reads an M5Stack Unit Light (U012) on the Grove
+port. That sensor does the actual latency measurement: in the three HID
+modes a press starts a clock at the button edge and stops it when the
+light crosses `LIGHT_THRESHOLD` (default 3000 ADC counts), so the figure
+on screen covers button-down → USB → host → compositor → panel. A fourth
+mode, `MODE_LIGHT`, constructs no HID device and just meters the sensor,
+for aiming it and checking that the threshold falls between the display's
+two states. The S3-Zero has neither a Grove port nor a screen, so it
+reports a mode count of 3 and never offers `MODE_LIGHT`.
+
 ## Build
 
 ```
@@ -57,11 +67,14 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   always sent *before* any board feedback is drawn, so lighting an LED or
   repainting a screen is never in the latency path.
 - `src/mode.h` — the `Mode` enum plus the strings naming it (mode name,
-  the action a press sends, the USB product string). Header-only lookup
-  tables, shared by the core and the board layer.
+  the action a press sends, the USB product string) and `modeSendsHid()`.
+  Header-only lookup tables, shared by the core and the board layer.
+  `MODE_LIGHT` must stay last in the enum: a board without a sensor
+  returns `MODE_LIGHT` from `boardModeCount()`, and because it is last,
+  its index *is* the number of modes that precede it.
 - `src/board.h` — the board I/O contract: `boardBegin()`,
-  `boardButtonPressed()`, `boardShowBoot()`, `boardShowPress()`,
-  `boardShowPending()`. Exactly one implementation is compiled per env, so
+  `boardModeCount()`, `boardButtonPressed()`, `boardShowBoot()`,
+  `boardShowPress()`, `boardShowPending()`. Exactly one implementation is compiled per env, so
   there are no board `#ifdef`s in `main.cpp` and nothing in the board layer
   touches USB. Mode state is passed in rather than duplicated there.
 - `src/board_s3zero.cpp` — ESP32-S3-Zero: BOOT button (GPIO0, active-low),
@@ -74,15 +87,38 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   the active mode's colour (`BOOT_FLASH_MS`, 200ms) so the mode is visible
   without pressing the button first.
 - `src/board_atoms3r.cpp` — AtomS3R: screen button (GPIO41, active-low —
-  the whole LCD face is the button), 0.85" 128x128 LCD via M5GFX. Because a
-  screen can show the mode permanently, it does: title, the active mode's
-  name in its colour, a rounded "action box" naming what a press sends
-  (filled with the mode colour while held, outlined when idle), and a
-  footer that is either `hold 3s: next mode` or — once a hold has queued a
-  change — the pending mode plus `on next reset`. A press repaints only the
-  action box, not the whole screen. `display.init()` runs in
-  `boardShowBoot()`, i.e. *after* `USB.begin()`, so panel autodetect and
-  backlight bring-up don't delay enumeration.
+  the whole LCD face is the button), 0.85" 128x128 LCD via M5GFX, and the
+  Unit Light's analog output on GPIO1 (ADC1_CH0). Because a screen can
+  show state permanently, it does: the live light reading (raw ADC count,
+  volts, and a bar) across the top, then the active mode's name in its
+  colour, a rounded "action box" naming what a press sends (filled with
+  the mode colour while held, outlined when idle), and a footer that is
+  either `hold 3s: next mode` or — once a hold has queued a change — the
+  pending mode plus `on next reset`.
+
+  **Nothing here draws from `loop()`.** All panel access and all ADC
+  sampling happen in one task (`uiTaskFn`) pinned to core 0, while
+  `loop()` has core 1 to itself (`ARDUINO_RUNNING_CORE=1`), so a repaint
+  can never stretch a loop iteration and delay noticing the next button
+  edge. The entry points called from `loop()` only store a value into a
+  `volatile` and call `xTaskNotifyGive()` — a few microseconds, and it
+  can't preempt core 1. The task blocks in `ulTaskNotifyTake()` with a
+  `LIGHT_PERIOD_MS` (100ms) timeout, so it wakes either on a press/release
+  edge or on the timeout. `display.init()` also runs in that task, so
+  panel autodetect and backlight bring-up are off the critical core too.
+
+  `runMeasurement()` is the measurement itself, also on core 0. `t0` is
+  `esp_timer_get_time()` sampled in `loop()` at the button edge, *before*
+  the HID report is queued, and handed over through `boardShowPress()` —
+  so the HID send counts as part of what's measured. The crossing
+  direction is not configured: a baseline is sampled at the start and the
+  clock stops on the first reading that has reached the other side of the
+  threshold, which makes a dark screen flashing bright and a bright screen
+  going dark both work off one threshold value. The poll is tight and
+  unyielding (`analogRead()` is tens of µs, so it resolves far finer than
+  a millisecond), bounded by `MEASURE_TIMEOUT_MS` (500ms) — see the
+  core-0-starvation gotcha below. The top strip shows the last figure plus
+  a running count/min/mean.
 
 ## Gotchas already hit
 
@@ -204,3 +240,40 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   for GPIO0 — on the AtomS3R it is an I2C clock line, not a button, so
   none of the GPIO0-strapping-pin warnings elsewhere in this file apply to
   that board.
+- **Unit Light analog output lands on GPIO1, not GPIO2.** Chasing it
+  through three mappings: the unit (U012, photoresistor + LM393) puts its
+  *digital* comparator output on the yellow wire and its *analog* output
+  on the white wire; on a Port A Grove connector yellow is the SDA line
+  and white is the SCL line; and M5Unified's pin table gives the AtomS3R
+  external port as SCL=GPIO1, SDA=GPIO2. So analog → GPIO1 (ADC1_CH0),
+  digital → GPIO2. Note the inversion in M5Unified's naming while you're
+  in there: `port_a_pin1` is SCL and `port_a_pin2` is SDA, which is the
+  opposite order from the wire colours. Only the analog side is read.
+  Caveat not yet checked on hardware: the unit is a 5V part, so if its
+  analog swing really does reach 5V it will clip at the ADC's ~3.3V
+  ceiling (4095) rather than damaging anything visible in the reading.
+- **A press in a measuring mode doesn't light the action box until the
+  measurement finishes.** This is deliberate, not a dropped frame: the UI
+  task must not be pushing pixels over SPI while it is sampling the
+  sensor, because a repaint both delays the first sample and can straddle
+  the very change being timed. So `boardShowPress()` hands over the
+  timestamp, and the box is repainted after `runMeasurement()` returns —
+  tens of milliseconds normally, `MEASURE_TIMEOUT_MS` in the no-response
+  case. A tap shorter than the measurement may never show the box lit at
+  all.
+- **`runMeasurement()` deliberately starves core 0's idle task**, which is
+  why `MEASURE_TIMEOUT_MS` exists and why it is 500ms. The poll loop does
+  not yield: yielding on every sample (`vTaskDelay(1)`) would cap
+  resolution at the 1ms tick, which is 5% of a typical click-to-photon
+  figure and defeats the point. 500ms is 10% of the 5s task-watchdog
+  budget, so the starvation is safe; raising the timeout much past ~2s
+  would not be. None of this touches core 1, where `loop()` runs, and the
+  USB task sits at a higher priority on core 0 and still preempts the poll
+  freely.
+- **The threshold is a compile-time default, not a runtime setting.**
+  `LIGHT_THRESHOLD` defaults to 3000 and is `#ifndef`-guarded, so
+  `-DLIGHT_THRESHOLD=<counts>` in an env's `build_flags` overrides it.
+  There is no button UI for it: the button already carries press-to-send
+  and hold-to-cycle, and a third gesture would be one too many. `MODE_LIGHT`
+  draws the threshold as a tick on its bar, which is how you check the
+  value is in the right place without being able to edit it live.

@@ -5,12 +5,19 @@
  * keyboard (Space), or mouse (left click) — selected by the board's one
  * button:
  *   - Short press: send the active mode's action.
- *   - Hold for MODE_HOLD_MS (3s): select the next mode
- *     (gamepad -> keyboard -> mouse -> gamepad) as "pending" and persist
- *     it to NVS — this does NOT reboot or change what's active this
- *     session. Keep holding to cycle through further modes, one per
+ *   - Hold for MODE_HOLD_MS (3s): select the next mode as "pending" and
+ *     persist it to NVS — this does NOT reboot or change what's active
+ *     this session. Keep holding to cycle through further modes, one per
  *     MODE_HOLD_MS. A manual reboot (reset button, or unplug/replug) is
  *     required for the pending mode to actually take effect.
+ *
+ * On a board with a light sensor there is a fourth mode, MODE_LIGHT,
+ * which constructs no HID device at all and just meters the sensor — it
+ * exists to aim the sensor and pick a threshold. In the three HID modes
+ * that same sensor is used the other way round: the press is timed
+ * through to the display responding to it, which is the number this whole
+ * project exists to produce. Boards with no sensor report a mode count of
+ * MODE_LIGHT (see boardModeCount()) and never offer the fourth mode.
  *
  * Two boards are supported, one PlatformIO env each. Everything specific
  * to a board — which pin the button is on, and how state is shown — lives
@@ -74,6 +81,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <esp_timer.h>
 #include <USB.h>
 #include <USBCDC.h>
 #include <USBHIDGamepad.h>
@@ -129,7 +137,7 @@ static inline void sendRelease() {
 // Advances pendingMode by one and persists it — takes effect on the next
 // manual reboot, not this session.
 static void advancePendingMode() {
-  pendingMode = static_cast<Mode>((pendingMode + 1) % MODE_COUNT);
+  pendingMode = static_cast<Mode>((pendingMode + 1) % boardModeCount());
   prefs.putUChar(PREFS_KEY, pendingMode);
 
   boardShowPending(activeMode, pendingMode, !cycledThisHold);
@@ -141,11 +149,13 @@ void setup() {
 
   prefs.begin(PREFS_NAMESPACE, false);
   uint8_t stored = prefs.getUChar(PREFS_KEY, MODE_GAMEPAD);
-  activeMode = (stored < MODE_COUNT) ? static_cast<Mode>(stored) : MODE_GAMEPAD;
+  activeMode = (stored < boardModeCount()) ? static_cast<Mode>(stored) : MODE_GAMEPAD;
   pendingMode = activeMode;
 
   // Construct the one active-mode device, and set the product name to
   // match, before USB.begin() — both are rejected as no-ops afterwards.
+  // MODE_LIGHT falls through to default and constructs nothing: it is a
+  // meter, not an input device, so that boot enumerates as CDC only.
   switch (activeMode) {
     case MODE_GAMEPAD:  gamepad = new USBHIDGamepad();  gamepad->begin();  break;
     case MODE_KEYBOARD: keyboard = new USBHIDKeyboard(); keyboard->begin(); break;
@@ -167,6 +177,9 @@ void loop() {
   // Outside the lockout window, any change is a real edge: act on it
   // immediately, then start the lockout to swallow bounce.
   if ((now - lastTriggerMs) >= DEBOUNCE_MS && raw != stableState) {
+    // t0 for latency measurement: the edge itself, before the report is
+    // queued, so the HID send counts as part of what's being measured.
+    int64_t edgeMicros = esp_timer_get_time();
     stableState = raw;
     lastTriggerMs = now;
 
@@ -178,7 +191,7 @@ void loop() {
     } else {
       sendRelease();
     }
-    boardShowPress(stableState, activeMode);
+    boardShowPress(stableState, activeMode, edgeMicros);
   }
 
   // A hold advances pendingMode one step per MODE_HOLD_MS, for as long as

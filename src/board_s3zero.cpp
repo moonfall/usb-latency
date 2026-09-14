@@ -43,6 +43,13 @@ void boardBegin() {
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 }
 
+// No light sensor on this board, so the rotation stops before MODE_LIGHT
+// — which, being last in the enum, means its index is also the count of
+// the modes that come before it.
+uint8_t boardModeCount() {
+  return MODE_LIGHT;
+}
+
 bool boardButtonPressed() {
   return digitalRead(BOOT_BUTTON_PIN) == LOW;  // active-low
 }
@@ -54,7 +61,8 @@ void boardShowBoot(Mode active, Mode pending) {
   setPixel(0, 0, 0);
 }
 
-void boardShowPress(bool pressed, Mode active) {
+void boardShowPress(bool pressed, Mode active, int64_t atMicros) {
+  (void)atMicros;  // nothing here to measure the machine's response with
   if (pressed) {
     showModeColor(active);
   } else {
