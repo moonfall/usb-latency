@@ -4,22 +4,26 @@
  * 128x128 LCD behind it as the indicator, and an M5Stack Unit Light on
  * the Grove port as the response sensor.
  *
- * The sensor is used two different ways depending on the mode:
+ * A press always starts a clock at the button edge and stops it when the
+ * sensor crosses LIGHT_THRESHOLD — i.e. it times button-down all the way
+ * through USB, the host, the compositor and the panel, to light actually
+ * changing. That happens in every mode and regardless of which view is
+ * up; all the meter view changes is what the top of the screen shows:
  *
- *   MODE_LIGHT      A meter. No HID device exists this boot; the top of
- *                   the screen just shows the live reading, as a number
- *                   and as a bar with the threshold marked on it. This is
- *                   the mode for aiming the sensor at the spot on the
- *                   display that will change, and for checking that the
- *                   change actually crosses LIGHT_THRESHOLD.
+ *   measure view  The last measurement plus a running count / minimum /
+ *                 mean. The default, and what you watch while testing.
  *
- *   everything else The point of the project. A press starts a clock at
- *                   the button edge and stops it when the sensor crosses
- *                   that same threshold — i.e. it times button-down all
- *                   the way through USB, the host, the compositor and the
- *                   panel, to light actually changing. The top of the
- *                   screen shows the last such measurement plus a running
- *                   count / minimum / mean.
+ *   meter view    The live sensor reading, as a number and as a bar with
+ *                 the threshold ticked on it. For aiming the sensor at
+ *                 the spot that will change and confirming the change
+ *                 really does cross the threshold. Presses still send
+ *                 their HID report here, so you can make the display do
+ *                 its thing and watch the bar move while you aim.
+ *
+ * The view toggles live, on a 4s hold — it touches no USB state, so
+ * unlike a Mode it costs no reboot. Measurements keep running and keep
+ * accumulating underneath the meter, so switching back shows the stats
+ * they built up.
  *
  * Layout, top to bottom:
  *
@@ -27,7 +31,7 @@
  *   n12 lo21.4 av24.9 | [==|====]    <- stats, or the bar + threshold tick
  *      GAMEPAD                       <- mode this boot enumerated as
  *   [ "X" button ]                   <- what a press sends; lit while held
- *    hold 3s: next mode              <- hint, or pending mode + reset note
+ *    hold: reset stats               <- next hold rung, or pending mode
  *
  * NOTHING here draws from loop(). All panel access, all ADC sampling and
  * the whole measurement loop happen in one task pinned to core 0
@@ -70,12 +74,12 @@ static const uint8_t BRIGHTNESS = 160;
 // here; the digital side is left alone.
 static const uint8_t LIGHT_ANALOG_PIN = 1;
 static const int ADC_MAX = 4095;              // 12-bit, the Arduino default
-static const uint32_t LIGHT_PERIOD_MS = 100;  // metering cadence in MODE_LIGHT
+static const uint32_t LIGHT_PERIOD_MS = 100;  // metering cadence in the meter view
 static const int LIGHT_DEADBAND = 8;          // counts of ADC noise not worth a repaint
 
 // The level the reading has to cross for a measurement to stop. Override
 // from platformio.ini with -DLIGHT_THRESHOLD=<counts> if 3000 doesn't
-// sit between your display's two states; MODE_LIGHT draws it on the bar
+// sit between your display's two states; the meter view draws it on the bar
 // so you can see where it falls.
 #ifndef LIGHT_THRESHOLD
 #define LIGHT_THRESHOLD 3000
@@ -115,6 +119,9 @@ static volatile Mode wantActive = MODE_GAMEPAD;
 static volatile Mode wantPending = MODE_GAMEPAD;
 static volatile int64_t pressMicros = 0;
 static volatile bool measurePending = false;
+static volatile bool resetRequested = false;
+static volatile bool meterToggleRequested = false;
+static volatile HoldRung wantHint = RUNG_STATS;
 
 // Measurement results. Touched only by uiTask, so no synchronisation.
 static const int32_t LAT_NONE = -1;     // nothing measured yet
@@ -124,6 +131,10 @@ static uint32_t measCount = 0;
 static uint32_t measMinUs = 0;
 static uint64_t measSumUs = 0;
 
+// Which of the two top-strip views is up. Owned by uiTask, flipped only
+// in response to meterToggleRequested.
+static bool meterView = false;
+
 static uint16_t black() { return display.color565(0, 0, 0); }
 
 static uint16_t modeColor(Mode mode) {
@@ -131,7 +142,6 @@ static uint16_t modeColor(Mode mode) {
     case MODE_GAMEPAD:  return display.color565(255,  72,  56);  // red
     case MODE_KEYBOARD: return display.color565( 48, 214,  96);  // green
     case MODE_MOUSE:    return display.color565( 72, 150, 255);  // blue
-    case MODE_LIGHT:    return display.color565(230, 200,  90);  // amber
     default:            return display.color565(255, 255, 255);
   }
 }
@@ -175,7 +185,7 @@ static void runMeasurement(int64_t t0) {
   }
 }
 
-// MODE_LIGHT's top strip: the raw ADC count and its voltage, plus the
+// The meter view's top strip: the raw ADC count and its voltage, plus the
 // same value as a bar with the threshold ticked on it, so the sensor can
 // be aimed and the threshold sanity-checked at a glance.
 static void drawLightStrip(int raw, uint32_t mv) {
@@ -204,7 +214,7 @@ static void drawLightStrip(int raw, uint32_t mv) {
   display.drawFastVLine(tick, TOP_SUB_Y - 2, BAR_H + 4, tickColor);
 }
 
-// Every other mode's top strip: the last measurement, and a running
+// The measure view's top strip: the last measurement, and a running
 // count / minimum / mean underneath it. One sample of a latency chain is
 // close to meaningless on its own, so the summary earns its line.
 static void drawLatencyStrip() {
@@ -250,8 +260,8 @@ static void drawLatencyStrip() {
   display.setTextPadding(0);
 }
 
-static void drawTopStrip(Mode active, int raw, uint32_t mv) {
-  if (active == MODE_LIGHT) {
+static void drawTopStrip(int raw, uint32_t mv) {
+  if (meterView) {
     drawLightStrip(raw, mv);
   } else {
     drawLatencyStrip();
@@ -278,16 +288,45 @@ static void drawActionBox(Mode active, bool pressed) {
   display.drawString(modeAction(active), SCREEN_W / 2, BOX_Y + BOX_H / 2);
 }
 
-static void drawFrame(Mode active, Mode pending, bool pressed, int raw, uint32_t mv) {
+// Footer: either the mode change already queued up and waiting on a
+// reboot (see main.cpp for why it has to wait), which outranks everything
+// because it's the one thing needing action elsewhere — or else what
+// carrying on holding the button would do next. Drawn on its own so the
+// hint can change mid-hold without a full repaint.
+static void drawFooter(Mode active, Mode pending, HoldRung hint) {
   uint16_t dim = display.color565(110, 110, 110);
   uint16_t amber = display.color565(255, 190, 40);
 
+  display.fillRect(0, FOOT1_Y, SCREEN_W, SCREEN_W - FOOT1_Y, black());
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+
+  if (pending != active) {
+    display.setTextColor(amber, black());
+    display.drawString(modeName(pending), SCREEN_W / 2, FOOT1_Y);
+    display.setTextColor(dim, black());
+    display.drawString("on next reset", SCREEN_W / 2, FOOT2_Y);
+    return;
+  }
+
+  const char *text = "";
+  switch (hint) {
+    case RUNG_STATS: text = "hold: reset stats"; break;
+    case RUNG_METER: text = meterView ? "hold: latency view" : "hold: light meter"; break;
+    case RUNG_MODE:  text = "hold: next mode"; break;
+  }
+  display.setTextColor(dim, black());
+  display.drawString(text, SCREEN_W / 2, FOOT1_Y);
+}
+
+static void drawFrame(Mode active, Mode pending, bool pressed, int raw, uint32_t mv,
+                      HoldRung hint) {
   display.startWrite();
   display.fillScreen(black());
 
-  drawTopStrip(active, raw, mv);
+  drawTopStrip(raw, mv);
 
-  // The mode name is the headline. Font4 fits all four names at this
+  // The mode name is the headline. Font4 fits all three names at this
   // width, but fall back a size rather than clip if that ever changes.
   display.setTextDatum(textdatum_t::middle_center);
   display.setTextColor(modeColor(active), black());
@@ -298,20 +337,7 @@ static void drawFrame(Mode active, Mode pending, bool pressed, int raw, uint32_t
   display.drawString(modeName(active), SCREEN_W / 2, MODE_Y);
 
   drawActionBox(active, pressed);
-
-  // Footer: either how to change the mode, or the change already queued
-  // up and waiting on a reboot (see main.cpp for why it has to wait).
-  display.setFont(&fonts::Font0);
-  display.setTextDatum(textdatum_t::top_center);
-  if (pending == active) {
-    display.setTextColor(dim, black());
-    display.drawString("hold 3s: next mode", SCREEN_W / 2, FOOT1_Y);
-  } else {
-    display.setTextColor(amber, black());
-    display.drawString(modeName(pending), SCREEN_W / 2, FOOT1_Y);
-    display.setTextColor(dim, black());
-    display.drawString("on next reset", SCREEN_W / 2, FOOT2_Y);
-  }
+  drawFooter(active, pending, hint);
 
   display.endWrite();
 }
@@ -330,6 +356,8 @@ static void uiTaskFn(void *) {
   Mode shownActive = MODE_COUNT;  // MODE_COUNT != any real mode, forcing
   Mode shownPending = MODE_COUNT; // the first pass to draw a full frame
   bool shownPressed = false;
+  bool shownMeter = false;
+  HoldRung shownHint = RUNG_STATS;
   int shownRaw = -1;
 
   int raw = 0;
@@ -340,23 +368,43 @@ static void uiTaskFn(void *) {
     Mode active = wantActive;
     Mode pending = wantPending;
     bool pressed = wantPressed;
-    bool newFrame = (active != shownActive || pending != shownPending);
-    bool topDirty = false;
+    HoldRung hint = wantHint;
 
-    if (newFrame) shownRaw = -1;  // whatever is cached belongs to the old mode
+    // Requests from loop() on the other core. Both are deferred to here
+    // so that the stats and the view stay single-threaded on core 0.
+    bool statsCleared = false;
+    if (resetRequested) {
+      resetRequested = false;
+      lastLatencyUs = LAT_NONE;
+      measCount = 0;
+      measMinUs = 0;
+      measSumUs = 0;
+      statsCleared = true;
+    }
+    if (meterToggleRequested) {
+      meterToggleRequested = false;
+      meterView = !meterView;
+    }
+
+    bool newFrame = (active != shownActive || pending != shownPending ||
+                     meterView != shownMeter);
+    // A clear only shows up in the measure view; the meter view is live
+    // anyway and will repaint on its own cadence.
+    bool topDirty = statsCleared && !meterView;
+
+    if (newFrame) shownRaw = -1;  // whatever is cached belongs to the old view
 
     // Measure BEFORE drawing anything. A repaint here would delay the
     // first sample by a millisecond or two of SPI, and — much worse —
-    // could straddle the very change being timed.
+    // could straddle the very change being timed. This runs in the meter
+    // view too: the measurement is what the press is for either way.
     if (measurePending) {
       measurePending = false;
-      if (active != MODE_LIGHT) {
-        runMeasurement(pressMicros);
-        topDirty = true;
-      }
+      runMeasurement(pressMicros);
+      if (!meterView) topDirty = true;
     }
 
-    if (active == MODE_LIGHT) {
+    if (meterView) {
       uint32_t now = millis();
       if (shownRaw < 0 || (uint32_t)(now - lastSampleMs) >= LIGHT_PERIOD_MS) {
         lastSampleMs = now;
@@ -371,10 +419,12 @@ static void uiTaskFn(void *) {
 
     if (displayReady) {
       if (newFrame) {
-        drawFrame(active, pending, pressed, raw, mv);
+        drawFrame(active, pending, pressed, raw, mv, hint);
         shownActive = active;
         shownPending = pending;
         shownPressed = pressed;
+        shownMeter = meterView;
+        shownHint = hint;
         shownRaw = raw;
       } else {
         if (pressed != shownPressed) {
@@ -385,15 +435,21 @@ static void uiTaskFn(void *) {
         }
         if (topDirty) {
           display.startWrite();
-          drawTopStrip(active, raw, mv);
+          drawTopStrip(raw, mv);
           display.endWrite();
           shownRaw = raw;
+        }
+        if (hint != shownHint) {
+          display.startWrite();
+          drawFooter(active, pending, hint);
+          display.endWrite();
+          shownHint = hint;
         }
       }
     }
 
-    // Wake on the next press/release edge, or after LIGHT_PERIOD_MS to
-    // re-meter the sensor — whichever comes first.
+    // Wake on the next press/release edge or hold rung, or after
+    // LIGHT_PERIOD_MS to re-meter the sensor — whichever comes first.
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(LIGHT_PERIOD_MS));
   }
 }
@@ -406,10 +462,25 @@ void boardBegin() {
   pinMode(SCREEN_BUTTON_PIN, INPUT_PULLUP);
 }
 
-// This board has the sensor, so it gets the full rotation including
-// MODE_LIGHT.
-uint8_t boardModeCount() {
-  return MODE_COUNT;
+// Light sensor on the Grove port plus a screen to put the answer on, so
+// this board gets the full hold ladder.
+bool boardHasSensor() {
+  return true;
+}
+
+void boardResetStats() {
+  resetRequested = true;
+  nudgeUi();
+}
+
+void boardToggleMeter() {
+  meterToggleRequested = true;
+  nudgeUi();
+}
+
+void boardShowHoldHint(HoldRung next) {
+  wantHint = next;
+  nudgeUi();
 }
 
 bool boardButtonPressed() {

@@ -21,12 +21,33 @@
 // so it doesn't sit between power-up and USB.begin().
 void boardBegin();
 
-// How many modes this board's hold-to-cycle rotation offers. MODE_LIGHT is
-// last in the enum, so a board with no light sensor returns MODE_LIGHT and
-// gets the three HID modes only; one with a sensor returns MODE_COUNT.
-// main.cpp also validates the NVS-stored mode against this, so a mode
-// saved on one board can't strand the other.
-uint8_t boardModeCount();
+// True if this board can time the display's response to a press — i.e. it
+// has both a light sensor and somewhere to show the result. This is what
+// decides whether the hold ladder in main.cpp has its reset-stats and
+// toggle-meter rungs at all; a board without a sensor keeps the plain
+// one-rung ladder it always had.
+bool boardHasSensor();
+
+// Throw away the accumulated measurement statistics and start counting
+// again. Called from the hold ladder; a no-op without a sensor.
+void boardResetStats();
+
+// Flip between showing measured latency and showing the raw light meter.
+// Purely a rendering choice — the USB identity is untouched, presses
+// still send their HID report either way, and measurements still run and
+// accumulate while the meter is up. A no-op without a sensor.
+void boardToggleMeter();
+
+// What continuing to hold the button would do next. main.cpp owns the
+// ladder's timing and pushes this whenever the answer changes (including
+// on release, to reset the hint), so the board never duplicates the
+// thresholds — it just renders the label.
+enum HoldRung : uint8_t {
+  RUNG_STATS,  // keep holding -> reset stats
+  RUNG_METER,  // keep holding -> toggle the meter view
+  RUNG_MODE,   // keep holding -> advance the pending mode
+};
+void boardShowHoldHint(HoldRung next);
 
 // Raw, undebounced button state; true while held. main.cpp does the
 // debouncing, so this should be a plain read with no delay in it.

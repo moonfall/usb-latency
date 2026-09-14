@@ -13,14 +13,24 @@ tree:
 | `m5stack-atoms3r` | M5Stack AtomS3R | screen button (GPIO41) | 128x128 LCD |
 
 The AtomS3R variant also reads an M5Stack Unit Light (U012) on the Grove
-port. That sensor does the actual latency measurement: in the three HID
-modes a press starts a clock at the button edge and stops it when the
-light crosses `LIGHT_THRESHOLD` (default 3000 ADC counts), so the figure
-on screen covers button-down → USB → host → compositor → panel. A fourth
-mode, `MODE_LIGHT`, constructs no HID device and just meters the sensor,
-for aiming it and checking that the threshold falls between the display's
-two states. The S3-Zero has neither a Grove port nor a screen, so it
-reports a mode count of 3 and never offers `MODE_LIGHT`.
+port. That sensor does the actual latency measurement: a press starts a
+clock at the button edge and stops it when the light crosses
+`LIGHT_THRESHOLD` (default 3000 ADC counts), so the figure on screen
+covers button-down → USB → host → compositor → panel.
+
+The one button carries everything, as a ladder of hold durations:
+
+| hold | action | needs a sensor |
+| --- | --- | --- |
+| press | send the mode's HID report, and time the response | — |
+| 2s | reset the measurement statistics | yes |
+| 4s | toggle the light-meter view (live, no reboot) | yes |
+| 7s, then every 3s | advance the *pending* mode (reboot to apply) | — |
+
+Rungs the board can't use don't exist, and the rest close up: on the
+S3-Zero the ladder is just the original 3s / 6s / … mode cycle. The
+AtomS3R's footer names the next rung as you hold, which is the only thing
+making a three-rung ladder discoverable.
 
 ## Build
 
@@ -67,14 +77,16 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   always sent *before* any board feedback is drawn, so lighting an LED or
   repainting a screen is never in the latency path.
 - `src/mode.h` — the `Mode` enum plus the strings naming it (mode name,
-  the action a press sends, the USB product string) and `modeSendsHid()`.
-  Header-only lookup tables, shared by the core and the board layer.
-  `MODE_LIGHT` must stay last in the enum: a board without a sensor
-  returns `MODE_LIGHT` from `boardModeCount()`, and because it is last,
-  its index *is* the number of modes that precede it.
+  the action a press sends, the USB product string). Header-only lookup
+  tables, shared by the core and the board layer. A `Mode` is a USB
+  identity and nothing more, which is exactly why it is stuck until a
+  reboot — see the light-meter-is-not-a-mode gotcha below.
 - `src/board.h` — the board I/O contract: `boardBegin()`,
-  `boardModeCount()`, `boardButtonPressed()`, `boardShowBoot()`,
-  `boardShowPress()`, `boardShowPending()`. Exactly one implementation is compiled per env, so
+  `boardHasSensor()`, `boardButtonPressed()`, `boardShowBoot()`,
+  `boardShowPress()`, `boardShowPending()`, `boardResetStats()`,
+  `boardToggleMeter()`, `boardShowHoldHint()`. main.cpp owns the hold
+  ladder's timing and pushes the resulting hint down, so the board renders
+  a label and never duplicates a threshold. Exactly one implementation is compiled per env, so
   there are no board `#ifdef`s in `main.cpp` and nothing in the board layer
   touches USB. Mode state is passed in rather than duplicated there.
 - `src/board_s3zero.cpp` — ESP32-S3-Zero: BOOT button (GPIO0, active-low),
@@ -118,7 +130,9 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   unyielding (`analogRead()` is tens of µs, so it resolves far finer than
   a millisecond), bounded by `MEASURE_TIMEOUT_MS` (500ms) — see the
   core-0-starvation gotcha below. The top strip shows the last figure plus
-  a running count/min/mean.
+  a running count/min/mean, unless the meter view is up — measurements run
+  and accumulate either way, so switching back shows the stats they built
+  while you were aiming.
 
 ## Gotchas already hit
 
@@ -277,3 +291,14 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   and hold-to-cycle, and a third gesture would be one too many. `MODE_LIGHT`
   draws the threshold as a tick on its bar, which is how you check the
   value is in the right place without being able to edit it live.
+- **The light meter is not a `Mode`, and making it one was a mistake worth
+  not repeating.** It was briefly `MODE_LIGHT`, a fourth entry in the
+  rotation that constructed no HID device — which meant switching into or
+  out of it needed a reboot, for a feature that touches no USB state at
+  all. It also meant a press sent nothing while the meter was up, so you
+  couldn't make the display do the thing you were trying to aim at. The
+  split that actually holds: a `Mode` is a USB identity (boot-fixed,
+  reboot to change, three of them), and the meter is a *view* the board
+  layer flips at runtime (`boardToggleMeter()`, no USB involvement, HID
+  reports and measurements carry on underneath it). If something new needs
+  switching, the first question is which of those two it is.

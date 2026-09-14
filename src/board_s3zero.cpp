@@ -43,11 +43,19 @@ void boardBegin() {
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 }
 
-// No light sensor on this board, so the rotation stops before MODE_LIGHT
-// — which, being last in the enum, means its index is also the count of
-// the modes that come before it.
-uint8_t boardModeCount() {
-  return MODE_LIGHT;
+// No Grove port and no screen, so there is nothing to measure with and
+// nowhere to put a reading. The hold ladder collapses to its one original
+// rung and the three calls below are all no-ops.
+bool boardHasSensor() {
+  return false;
+}
+
+void boardResetStats() {}
+
+void boardToggleMeter() {}
+
+void boardShowHoldHint(HoldRung next) {
+  (void)next;  // one rung, and a single LED can't spell it out anyway
 }
 
 bool boardButtonPressed() {

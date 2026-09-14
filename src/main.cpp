@@ -4,20 +4,27 @@
  * Emulates exactly ONE USB HID device at a time — gamepad ("X" button),
  * keyboard (Space), or mouse (left click) — selected by the board's one
  * button:
- *   - Short press: send the active mode's action.
- *   - Hold for MODE_HOLD_MS (3s): select the next mode as "pending" and
- *     persist it to NVS — this does NOT reboot or change what's active
- *     this session. Keep holding to cycle through further modes, one per
- *     MODE_HOLD_MS. A manual reboot (reset button, or unplug/replug) is
- *     required for the pending mode to actually take effect.
+ * The one button carries everything, as a ladder of hold durations:
+ *   - Short press: send the active mode's action (and, on a board with a
+ *     light sensor, time the display's response to it).
+ *   - Hold 2s: reset the measurement statistics.
+ *   - Hold 4s: toggle between the latency readout and the raw light
+ *     meter. Live — no reboot, no change to the USB identity.
+ *   - Hold 7s, and every MODE_HOLD_MS after: select the next mode as
+ *     "pending" and persist it to NVS. This does NOT reboot or change
+ *     what's active this session; a manual reboot (reset button, or
+ *     unplug/replug) is required for it to take effect.
+ * The first two rungs only exist on a board with a sensor. Without one
+ * the ladder collapses to its single original rung, with the mode cycle
+ * back at MODE_HOLD_MS (3s) where it has always been.
  *
- * On a board with a light sensor there is a fourth mode, MODE_LIGHT,
- * which constructs no HID device at all and just meters the sensor — it
- * exists to aim the sensor and pick a threshold. In the three HID modes
- * that same sensor is used the other way round: the press is timed
- * through to the display responding to it, which is the number this whole
- * project exists to produce. Boards with no sensor report a mode count of
- * MODE_LIGHT (see boardModeCount()) and never offer the fourth mode.
+ * Note what is NOT on that ladder: the light meter is not a Mode. A Mode
+ * is a USB identity, which is why it's stuck until a reboot — and the
+ * meter touches no USB state whatsoever, so tying it to one would have
+ * cost a reboot for nothing. It's a view the board layer flips at
+ * runtime, and presses keep sending their HID report while it's up, which
+ * is exactly what you want when aiming the sensor: press the button,
+ * watch the thing you're pointing at change, and watch the bar move.
  *
  * Two boards are supported, one PlatformIO env each. Everything specific
  * to a board — which pin the button is on, and how state is shown — lives
@@ -93,7 +100,14 @@
 
 // --- Configuration ---------------------------------------------------
 static const uint32_t DEBOUNCE_MS = 25;     // lockout window after a trigger
-static const uint32_t MODE_HOLD_MS = 3000;  // hold time per mode-cycle step
+
+// The hold ladder. The first two rungs exist only where boardHasSensor();
+// the mode rung then follows MODE_HOLD_MS after the last rung that does
+// exist, and repeats at that interval for as long as the button is held.
+// So: 2s / 4s / 7s / 10s ... with a sensor, and plain 3s / 6s ... without.
+static const uint32_t STATS_HOLD_MS = 2000;
+static const uint32_t METER_HOLD_MS = 4000;
+static const uint32_t MODE_HOLD_MS = 3000;
 
 static const char *PREFS_NAMESPACE = "usbmode";
 static const char *PREFS_KEY = "mode";
@@ -116,6 +130,18 @@ static uint32_t lastTriggerMs = 0;
 static uint32_t nextCycleMs = 0;   // when the current hold next advances pendingMode
 static bool cycledThisHold = false;  // true once this hold has advanced the mode at least once
 
+// Rungs still ahead in the current hold, with the time each one fires.
+static bool statsRungAhead = false;
+static uint32_t statsAtMs = 0;
+static bool meterRungAhead = false;
+static uint32_t meterAtMs = 0;
+
+// The rung a fresh hold would reach first — also what the hint falls back
+// to on release.
+static inline HoldRung firstRung() {
+  return boardHasSensor() ? RUNG_STATS : RUNG_MODE;
+}
+
 static inline void sendPress() {
   switch (activeMode) {
     case MODE_GAMEPAD:  gamepad->pressButton(BUTTON_X); break;
@@ -137,7 +163,7 @@ static inline void sendRelease() {
 // Advances pendingMode by one and persists it — takes effect on the next
 // manual reboot, not this session.
 static void advancePendingMode() {
-  pendingMode = static_cast<Mode>((pendingMode + 1) % boardModeCount());
+  pendingMode = static_cast<Mode>((pendingMode + 1) % MODE_COUNT);
   prefs.putUChar(PREFS_KEY, pendingMode);
 
   boardShowPending(activeMode, pendingMode, !cycledThisHold);
@@ -149,13 +175,11 @@ void setup() {
 
   prefs.begin(PREFS_NAMESPACE, false);
   uint8_t stored = prefs.getUChar(PREFS_KEY, MODE_GAMEPAD);
-  activeMode = (stored < boardModeCount()) ? static_cast<Mode>(stored) : MODE_GAMEPAD;
+  activeMode = (stored < MODE_COUNT) ? static_cast<Mode>(stored) : MODE_GAMEPAD;
   pendingMode = activeMode;
 
   // Construct the one active-mode device, and set the product name to
   // match, before USB.begin() — both are rejected as no-ops afterwards.
-  // MODE_LIGHT falls through to default and constructs nothing: it is a
-  // meter, not an input device, so that boot enumerates as CDC only.
   switch (activeMode) {
     case MODE_GAMEPAD:  gamepad = new USBHIDGamepad();  gamepad->begin();  break;
     case MODE_KEYBOARD: keyboard = new USBHIDKeyboard(); keyboard->begin(); break;
@@ -168,6 +192,7 @@ void setup() {
 
   // Only now that USB is up is it safe to spend time on the indicator.
   boardShowBoot(activeMode, pendingMode);
+  boardShowHoldHint(firstRung());
 }
 
 void loop() {
@@ -186,19 +211,40 @@ void loop() {
     // HID report first, feedback second — never the other way round.
     if (stableState) {
       sendPress();
-      nextCycleMs = now + MODE_HOLD_MS;
+      // Lay out this hold's ladder, skipping the rungs the board has no
+      // use for so the mode rung stays where it has always been on a
+      // board without a sensor.
       cycledThisHold = false;
+      statsRungAhead = meterRungAhead = boardHasSensor();
+      statsAtMs = now + STATS_HOLD_MS;
+      meterAtMs = now + METER_HOLD_MS;
+      nextCycleMs = (boardHasSensor() ? meterAtMs : now) + MODE_HOLD_MS;
     } else {
       sendRelease();
+      statsRungAhead = meterRungAhead = false;
+      boardShowHoldHint(firstRung());
     }
     boardShowPress(stableState, activeMode, edgeMicros);
   }
 
-  // A hold advances pendingMode one step per MODE_HOLD_MS, for as long as
-  // the button stays down — see file header for why this only selects a
-  // mode for the next manual reboot, rather than switching live.
-  if (stableState && now >= nextCycleMs) {
-    advancePendingMode();
-    nextCycleMs = now + MODE_HOLD_MS;
+  // Walk the ladder for as long as the button stays down. Each rung fires
+  // once per hold, then hands the hint on to the next one.
+  if (stableState) {
+    if (statsRungAhead && now >= statsAtMs) {
+      statsRungAhead = false;
+      boardResetStats();
+      boardShowHoldHint(RUNG_METER);
+    }
+    if (meterRungAhead && now >= meterAtMs) {
+      meterRungAhead = false;
+      boardToggleMeter();
+      boardShowHoldHint(RUNG_MODE);
+    }
+    // The top rung repeats: see the file header for why it only selects a
+    // mode for the next manual reboot, rather than switching live.
+    if (now >= nextCycleMs) {
+      advancePendingMode();
+      nextCycleMs = now + MODE_HOLD_MS;
+    }
   }
 }
