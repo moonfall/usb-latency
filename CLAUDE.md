@@ -29,11 +29,12 @@ a menu (AtomS3R only) is open:
 | normal | hold 3s, repeating | advance the *pending* mode (reboot to apply) | no (S3-Zero only) |
 | menu | tap | advance — move the selection, or the mode-picker's candidate | yes |
 | menu | hold 1s | trigger the highlighted item | yes |
+| auto test running | press | stop the run (and nothing else) | yes |
 
 The S3-Zero has no screen and so no menu — its button is exactly what it
 always was: press sends the action, holding cycles the pending mode every
 3s. On the AtomS3R, a 2s hold from normal operation opens a small menu
-(`Light meter`, `Change mode`, `Exit`) that owns every subsequent press
+(`Light meter`, `Auto test`, `Change mode`, `Exit`) that owns every subsequent press
 until it exits: tap cycles the highlighted item, a 1s+ hold triggers it.
 `Change mode` drops into a picker where tap advances the candidate mode
 (persisting it immediately, same NVS write the S3-Zero's hold-to-cycle
@@ -42,6 +43,16 @@ toggles instantly and exits; `Exit` just exits. No press reaches the
 HID/measurement path while the menu is open — see `wasMenuActiveAtPress`
 in `main.cpp` for how that's decided once per press rather than
 re-checked live.
+
+`Auto test` runs `AUTO_TEST_ITERATIONS` (500) presses in the current mode
+unattended, spaced by a random 200-500ms gap — roughly three to five
+minutes, abortable at any point with a press — each going through exactly
+the same send-and-measure path a real button press does. It lives in
+`main.cpp` (`serviceAutoTest()`), not the board layer, because only
+`main.cpp` may touch USB and an automated press has to be a genuine HID
+report or it isn't measuring the same thing. It does **not** clear the
+existing stats first — reset with a 1s hold beforehand if a clean
+distribution is wanted.
 
 ## Build
 
@@ -373,3 +384,24 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   depends on the specific photoresistor circuit's polarity, which hasn't
   been characterized here. Read it off the meter view: watch which way the
   bar moves for a known transition.
+- **The automated test paces itself on measurement completion, not on a
+  guessed interval.** `serviceAutoTest()` won't release a press — and so
+  won't start the next one — until `boardMeasurementBusy()` goes false.
+  Sequencing on a fixed delay instead would eventually start a press
+  while the previous measurement was still running, and the new press
+  overwrites the `pressMicros` that measurement is still timing against,
+  silently corrupting the sample. Note `measureBusy` is a *separate* flag
+  from `measurePending`: the UI task clears pending the moment it picks
+  the work up, which is the start of the measurement, not the end.
+  There's still a hard `AUTO_HOLD_MAX_MS` ceiling on how long a press may
+  stay down regardless — a wedged measurement must not leave the host
+  holding a HID button forever, which is a much worse failure than a lost
+  sample.
+- **The gap between automated presses is random on purpose.** A fixed
+  interval can alias with the display's refresh cadence, parking every
+  sample at the same phase within a frame and biasing the distribution
+  the tool exists to measure — which matters especially here, given the
+  bimodality this firmware was being used to chase. The first gap is
+  randomised too rather than firing immediately, because the button *is*
+  the screen face, inches from wherever the sensor is aimed: the instant
+  the user lets go of it is exactly the wrong time to take a reading.

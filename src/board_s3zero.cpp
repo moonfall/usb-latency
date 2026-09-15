@@ -67,6 +67,14 @@ void boardEnterMenu() {}
 void boardMenuTap() {}
 void boardMenuSelect() {}
 
+// No sensor means no measurement to be busy with, and no menu means the
+// automated test can never be started here in the first place.
+bool boardMeasurementBusy() { return false; }
+void boardShowAutoTest(uint16_t done, uint16_t total) {
+  (void)done;
+  (void)total;
+}
+
 bool boardButtonPressed() {
   return digitalRead(BOOT_BUTTON_PIN) == LOW;  // active-low
 }

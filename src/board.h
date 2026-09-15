@@ -75,6 +75,20 @@ void boardMenuTap();
 // operation, or just leaving the menu.
 void boardMenuSelect();
 
+// True from the moment a press hands a measurement over until that
+// measurement has finished — i.e. it covers the whole span, unlike the
+// board's internal "a measurement is queued" flag. The automated test
+// uses it to pace itself one press per *completed* measurement instead
+// of guessing an interval long enough to cover the worst case. Always
+// false on a board with no sensor, which has no measurement to be busy
+// with.
+bool boardMeasurementBusy();
+
+// Progress readout while the automated test runs: `done` out of `total`.
+// total == 0 means "not running", which puts the normal display back.
+// A no-op on a board with no screen to show it on.
+void boardShowAutoTest(uint16_t done, uint16_t total);
+
 // Raw, undebounced button state; true while held. main.cpp does the
 // debouncing, so this should be a plain read with no delay in it.
 bool boardButtonPressed();
@@ -110,3 +124,13 @@ void boardShowPending(Mode active, Mode pending, bool firstOfHold);
 // back through boardShowPending() above so the picker can show it. A
 // board with no menu never calls this.
 void appAdvancePendingMode();
+
+// Implemented in main.cpp; called by the menu's "Auto test" item. Starts
+// an unattended run of AUTO_TEST_ITERATIONS presses in the current mode,
+// spaced by a random gap, each one going through exactly the same
+// send-and-measure path a real button press does. It lives in main.cpp
+// rather than the board layer for the same reason the mode picker does:
+// only main.cpp may touch USB, and an automated press has to be a real
+// HID report or it isn't measuring the same thing. A board with no menu
+// never calls this.
+void appStartAutoTest();

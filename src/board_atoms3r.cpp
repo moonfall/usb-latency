@@ -60,11 +60,13 @@
  * (see board.h for the full normal/menu button contract — this file just
  * implements it):
  *
- *      MENU                    MENU_TOP: three items, cycled by tap,
+ *      MENU                    MENU_TOP: four items, cycled by tap,
  *    > Light meter              triggered by a 1s+ hold. Light meter
- *      Change mode              flips meterView and exits immediately;
- *      Exit                     Change mode drops into the picker below;
- *   tap: next  hold: select     Exit just leaves.
+ *      Auto test                flips meterView and exits; Auto test
+ *      Change mode              hands off to main.cpp (which owns USB,
+ *      Exit                     so it owns the presses) and exits;
+ *   tap: next  hold: select     Change mode drops into the picker
+ *                                below; Exit just leaves.
  *
  *   CHANGE MODE                MENU_MODE: tap advances the candidate via
  *     KEYBOARD                  appAdvancePendingMode() — the same NVS
@@ -168,11 +170,21 @@ static volatile Mode wantActive = MODE_GAMEPAD;
 static volatile Mode wantPending = MODE_GAMEPAD;
 static volatile int64_t pressMicros = 0;
 static volatile bool measurePending = false;
+// Covers the whole span a measurement occupies, unlike measurePending
+// which the task clears the moment it picks the work up. Set on core 1
+// in boardShowPress(), cleared on core 0 once runMeasurement() returns;
+// boardMeasurementBusy() is what the automated test paces itself on.
+static volatile bool measureBusy = false;
 static volatile bool resetRequested = false;
 static volatile bool enterMenuRequested = false;
 static volatile bool menuTapRequested = false;
 static volatile bool menuSelectRequested = false;
 static volatile HoldRung wantHint = RUNG_STATS;
+
+// Automated-test progress, pushed in from main.cpp (core 1) which owns
+// the run. autoTotal == 0 means no run is in progress.
+static volatile uint16_t autoDone = 0;
+static volatile uint16_t autoTotal = 0;
 
 // The menu's own state — see the file header for what each level looks
 // like. menuState is volatile because boardMenuActive() (below) is
@@ -181,9 +193,9 @@ static volatile HoldRung wantHint = RUNG_STATS;
 enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE };
 static volatile MenuState menuState = MENU_NONE;
 static int topIndex = 0;
-static const int NUM_TOP_ITEMS = 3;
+static const int NUM_TOP_ITEMS = 4;
 static const char *TOP_ITEM_LABELS[NUM_TOP_ITEMS] = {
-  "Light meter", "Change mode", "Exit"
+  "Light meter", "Auto test", "Change mode", "Exit"
 };
 
 // Measurement results. Touched only by uiTask, so no synchronisation.
@@ -404,10 +416,25 @@ static void drawModeLine(Mode active) {
 // holding the button would do next. Drawn on its own so the hint can
 // change mid-hold without a full repaint.
 static void drawNextLine(Mode active, Mode pending, HoldRung hint) {
-  char buf[24];
+  char buf[32];
   uint16_t color;
 
-  if (pending != active) {
+  if (autoTotal > 0) {
+    // An automated run outranks the other two: it's the only one of the
+    // three that changes second to second, and while it runs the button
+    // means "stop" rather than any of the hold rungs.
+    //
+    // Width: Font0 is a 6px cell, so 21 characters is the whole 128px
+    // panel. At AUTO_TEST_ITERATIONS = 500 the widest this ever renders
+    // is "AUTO 499/500 tap=stop" — exactly 21, exactly full width, no
+    // margin left. (Displayed done never reaches total: the run swaps
+    // back to the normal display on its last release.) Raising the
+    // iteration count to four digits would push this over and clip the
+    // tail, so shorten the hint if that ever happens.
+    snprintf(buf, sizeof(buf), "AUTO %u/%u tap=stop",
+             (unsigned)autoDone, (unsigned)autoTotal);
+    color = riseColor();
+  } else if (pending != active) {
     snprintf(buf, sizeof(buf), "-> %s", modeName(pending));
     color = display.color565(255, 190, 40);  // amber
   } else {
@@ -594,6 +621,8 @@ static void uiTaskFn(void *) {
   HoldRung shownHint = RUNG_STATS;
   MenuState shownMenuState = MENU_TOP;  // != MENU_NONE, same forcing trick
   int shownTopIndex = -1;
+  uint16_t shownAutoDone = 0xFFFF;      // != any real count, same trick again
+  uint16_t shownAutoTotal = 0xFFFF;
   int shownRaw = -1;
 
   int raw = 0;
@@ -639,8 +668,12 @@ static void uiTaskFn(void *) {
       if (menuState == MENU_TOP) {
         switch (topIndex) {
           case 0: meterView = !meterView; menuState = MENU_NONE; break;  // Light meter
-          case 1: menuState = MENU_MODE; break;                          // Change mode
-          case 2: menuState = MENU_NONE; break;                          // Exit
+          // Close the menu on the way out so the run is visible as it
+          // goes; main.cpp waits for the button to come up before its
+          // first press, so this hold can't leak into the data.
+          case 1: appStartAutoTest(); menuState = MENU_NONE; break;      // Auto test
+          case 2: menuState = MENU_MODE; break;                          // Change mode
+          case 3: menuState = MENU_NONE; break;                          // Exit
         }
       } else if (menuState == MENU_MODE) {
         // pendingMode is already persisted per tap — nothing to do here
@@ -669,6 +702,7 @@ static void uiTaskFn(void *) {
     if (measurePending) {
       measurePending = false;
       runMeasurement(pressMicros);
+      measureBusy = false;  // releases the automated test's next press
       histDirty = true;
       if (!meterView) topDirty = true;
     }
@@ -695,6 +729,8 @@ static void uiTaskFn(void *) {
         shownHint = hint;
         shownMenuState = menuState;
         shownTopIndex = topIndex;
+        shownAutoDone = autoDone;
+        shownAutoTotal = autoTotal;
         shownRaw = raw;
       } else if (!inMenu) {
         // The menu redraws only via newFrame above (any change to
@@ -711,11 +747,16 @@ static void uiTaskFn(void *) {
           drawHistogram();
           display.endWrite();
         }
-        if (hint != shownHint) {
+        // The same line carries the hold hint and the automated run's
+        // progress, so any of the three moving redraws it.
+        if (hint != shownHint || autoDone != shownAutoDone ||
+            autoTotal != shownAutoTotal) {
           display.startWrite();
           drawNextLine(active, pending, hint);
           display.endWrite();
           shownHint = hint;
+          shownAutoDone = autoDone;
+          shownAutoTotal = autoTotal;
         }
       }
     }
@@ -748,6 +789,16 @@ void boardResetStats() {
 
 void boardShowHoldHint(HoldRung next) {
   wantHint = next;
+  nudgeUi();
+}
+
+bool boardMeasurementBusy() {
+  return measureBusy;
+}
+
+void boardShowAutoTest(uint16_t done, uint16_t total) {
+  autoDone = done;
+  autoTotal = total;
   nudgeUi();
 }
 
@@ -795,6 +846,9 @@ void boardShowPress(bool pressed, Mode active, int64_t atMicros) {
     // while it is sampling. That's the measurement duration — tens of
     // milliseconds normally, MEASURE_TIMEOUT_MS at worst.
     pressMicros = atMicros;
+    // Before measurePending, so the task can never pick the work up and
+    // finish it in the window between the two and leave busy stuck true.
+    measureBusy = true;
     measurePending = true;
   }
   nudgeUi();

@@ -18,12 +18,17 @@
  *     - Short press: advance — move the highlighted item, or, inside the
  *       mode picker, advance the candidate mode.
  *     - Hold 1s: trigger the highlighted item's action.
- *   The menu holds the light meter (a live view, toggled instantly) and
- *   changing the pending mode (see appAdvancePendingMode()) — both used
- *   to be hold-ladder rungs of their own; moving them into a proper menu
- *   is what let short-press-to-advance and hold-to-select behave the
- *   same way at every level, instead of every feature inventing its own
- *   hold duration to remember.
+ *   The menu holds the light meter (a live view, toggled instantly),
+ *   the automated test (see appStartAutoTest()) and changing the pending
+ *   mode (see appAdvancePendingMode()). The first and last used to be
+ *   hold-ladder rungs of their own; moving them into a proper menu is
+ *   what let short-press-to-advance and hold-to-select behave the same
+ *   way at every level, instead of every feature inventing its own hold
+ *   duration to remember — and left somewhere obvious to put the third.
+ *
+ *   While an automated run is going, the button does one thing only:
+ *   stop it. Nothing else — no HID report, no hold rungs — because the
+ *   act of stopping a run must not land in that run's own data.
  *
  * A board with no sensor (no screen to draw a menu on) never has one:
  * the button stays exactly what it always was — short press sends the
@@ -102,6 +107,7 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <esp_random.h>
 #include <esp_timer.h>
 #include <USB.h>
 #include <USBCDC.h>
@@ -127,6 +133,25 @@ static const uint32_t MENU_SELECT_HOLD_MS = 1000;
 // Board-with-no-sensor only: the one original rung, repeating at this
 // interval for as long as the button stays held.
 static const uint32_t MODE_HOLD_MS = 3000;
+
+// --- Automated test ---------------------------------------------------
+// An unattended run of presses in the current mode, started from the
+// menu, so a distribution worth reading can be collected without
+// standing there tapping a button hundreds of times. At 500 presses and
+// a ~200-500ms gap each, a run takes roughly three to five minutes —
+// abortable at any point with a press. 500 also splits to ~250 samples
+// per direction, comfortably inside the board's HIST_CAPACITY (500 per
+// direction) so a whole run stays in the histogram.
+static const uint16_t AUTO_TEST_ITERATIONS = 500;
+static const uint32_t AUTO_HOLD_MS = 50;      // plausible press length
+static const uint32_t AUTO_GAP_MIN_MS = 200;  // gap between releases and the next press
+static const uint32_t AUTO_GAP_MAX_MS = 500;
+// Hard ceiling on how long an automated press may stay down. Normally the
+// measurement gates the release and this is never reached — it only bites
+// if a measurement somehow never finishes, and it exists because a stuck
+// HID button is a far worse thing to inflict on the host than one lost
+// sample. Comfortably above the board's own measurement timeout.
+static const uint32_t AUTO_HOLD_MAX_MS = 1000;
 
 static const char *PREFS_NAMESPACE = "usbmode";
 static const char *PREFS_KEY = "mode";
@@ -155,6 +180,18 @@ static bool statsRungAhead = false;
 static uint32_t statsAtMs = 0;
 static bool menuRungAhead = false;
 static uint32_t menuAtMs = 0;
+
+// Automated-test sequencer. AUTO_GAP is "waiting to start the next
+// press", AUTO_HOLDING is "pressed, waiting to release".
+enum AutoPhase : uint8_t { AUTO_OFF, AUTO_GAP, AUTO_HOLDING };
+static AutoPhase autoPhase = AUTO_OFF;
+static uint16_t autoDone = 0;
+static uint32_t autoPressedAtMs = 0;
+static uint32_t autoResumeAtMs = 0;
+// volatile: set by appStartAutoTest() from the board's UI task on core 0,
+// consumed by loop() on core 1.
+static volatile bool autoStartRequested = false;
+static bool pressAbortedAuto = false;  // this press stopped a run and sends nothing
 
 // Captured once, at the press edge, rather than re-checked live: if a
 // hold is the one that opens the menu partway through (crossing
@@ -206,6 +243,91 @@ void appAdvancePendingMode() {
   doAdvancePendingMode(false);
 }
 
+// Random rather than fixed, and this is the whole point of the gap: a
+// constant interval can alias with the display's refresh cadence, parking
+// every press at the same phase within a frame and quietly biasing the
+// very distribution this tool exists to measure. 200-500ms also keeps a
+// 100-press run to about a minute.
+static uint32_t autoGapMs() {
+  return AUTO_GAP_MIN_MS + (esp_random() % (AUTO_GAP_MAX_MS - AUTO_GAP_MIN_MS + 1));
+}
+
+static void stopAutoTest() {
+  // If the run was aborted mid-press, release — otherwise the host is
+  // left holding a button nobody is pressing.
+  if (autoPhase == AUTO_HOLDING) sendRelease();
+  autoPhase = AUTO_OFF;
+  boardShowAutoTest(0, 0);
+}
+
+void appStartAutoTest() {
+  autoStartRequested = true;
+}
+
+// Drives the automated run. Called every loop() pass, including while
+// the button is released — which is the normal case, since a run happens
+// with nobody touching the device.
+static void serviceAutoTest(uint32_t now) {
+  if (autoStartRequested) {
+    // Wait for the button to come up first. The menu item that requests
+    // a run is itself selected by a 1s hold, so the button is still down
+    // at that moment; starting immediately would fire the first press
+    // while the user is still holding, and that press would also be the
+    // one that gets debounced against their release.
+    if (stableState) return;
+    autoStartRequested = false;
+    autoDone = 0;
+    autoPhase = AUTO_GAP;
+    // A normal gap before the first press too, rather than firing the
+    // instant the button comes up: the button is the screen face, inches
+    // from wherever the sensor is aimed, so letting go of it is exactly
+    // the moment not to be taking a reading.
+    autoResumeAtMs = now + autoGapMs();
+    boardShowAutoTest(0, AUTO_TEST_ITERATIONS);
+  }
+
+  switch (autoPhase) {
+    case AUTO_OFF:
+      return;
+
+    case AUTO_GAP:
+      if ((int32_t)(now - autoResumeAtMs) < 0) return;
+      {
+        // Deliberately the same three lines the manual press path runs,
+        // timestamp and ordering included: an automated sample has to
+        // measure the same thing a real button press does, or the two
+        // can't be compared against each other.
+        int64_t edgeMicros = esp_timer_get_time();
+        sendPress();
+        boardShowPress(true, activeMode, edgeMicros);
+      }
+      autoPressedAtMs = now;
+      autoPhase = AUTO_HOLDING;
+      return;
+
+    case AUTO_HOLDING:
+      // Hold for a plausible press length, but never release before the
+      // measurement this press triggered has finished: the next press
+      // would overwrite the t0 that measurement is still timing against.
+      if ((now - autoPressedAtMs) < AUTO_HOLD_MS) return;
+      if (boardMeasurementBusy() && (now - autoPressedAtMs) < AUTO_HOLD_MAX_MS) return;
+
+      sendRelease();
+      boardShowPress(false, activeMode, esp_timer_get_time());
+      autoDone++;
+
+      if (autoDone >= AUTO_TEST_ITERATIONS) {
+        autoPhase = AUTO_OFF;
+        boardShowAutoTest(0, 0);
+      } else {
+        autoPhase = AUTO_GAP;
+        autoResumeAtMs = now + autoGapMs();
+        boardShowAutoTest(autoDone, AUTO_TEST_ITERATIONS);
+      }
+      return;
+  }
+}
+
 void setup() {
   boardBegin();
 
@@ -247,9 +369,17 @@ void loop() {
     lastTriggerMs = now;
 
     if (stableState) {
-      wasMenuActiveAtPress = boardHasSensor() && boardMenuActive();
+      // Three mutually exclusive things a press can be, decided here once
+      // and remembered for the rest of this hold (see wasMenuActiveAtPress
+      // above for why the decision can't be re-made at release time).
+      pressAbortedAuto = (autoPhase != AUTO_OFF);
+      wasMenuActiveAtPress = !pressAbortedAuto && boardHasSensor() && boardMenuActive();
 
-      if (wasMenuActiveAtPress) {
+      if (pressAbortedAuto) {
+        // Abort gesture, nothing else: no HID report, no hold ladder, or
+        // the act of stopping a run would land in that run's own data.
+        stopAutoTest();
+      } else if (wasMenuActiveAtPress) {
         // Presses inside the menu are navigation only — no HID report,
         // no measurement. Tap vs. hold-to-select is resolved on release
         // or by the timer below; nothing fires at the press edge itself.
@@ -269,7 +399,10 @@ void loop() {
         }
       }
     } else {
-      if (wasMenuActiveAtPress) {
+      if (pressAbortedAuto) {
+        // Consumed by the abort. stopAutoTest() already sent whatever
+        // release the run itself still owed, so there is nothing here.
+      } else if (wasMenuActiveAtPress) {
         // A release before the select threshold fired is a tap; one
         // that already fired (menuActionTaken) needs nothing further —
         // see boardMenuSelect() below.
@@ -283,7 +416,13 @@ void loop() {
     }
   }
 
+  // Runs whether or not the button is down — a run proceeds with nobody
+  // touching the device, so this has to come before the released-early-out.
+  serviceAutoTest(now);
+
   if (!stableState) return;
+
+  if (pressAbortedAuto) return;  // this hold's only job was stopping the run
 
   if (wasMenuActiveAtPress) {
     if (!menuActionTaken && (now - lastTriggerMs) >= MENU_SELECT_HOLD_MS) {
