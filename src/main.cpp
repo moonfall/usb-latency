@@ -30,6 +30,12 @@
  *   stop it. Nothing else — no HID report, no hold rungs — because the
  *   act of stopping a run must not land in that run's own data.
  *
+ *   Every run — finished or stopped early — is written out as a CSV file
+ *   on boards that have somewhere to put one. The samples are buffered
+ *   here in RAM for the whole run and handed down to boardWriteRun() once
+ *   at the end; see the recording block below for why they cannot be
+ *   written as they arrive.
+ *
  * A board with no sensor (no screen to draw a menu on) never has one:
  * the button stays exactly what it always was — short press sends the
  * action, and holding advances the pending mode one step per
@@ -193,6 +199,47 @@ static uint32_t autoResumeAtMs = 0;
 static volatile bool autoStartRequested = false;
 static bool pressAbortedAuto = false;  // this press stopped a run and sends nothing
 
+// --- Recording a run --------------------------------------------------
+// Every run is written out as a file when it ends (see board.h's
+// RunRecord contract and board_atoms3r.cpp for the format). The samples
+// are buffered here, in RAM, for the whole run: 500 of them is 4KB
+// against this chip's 320KB, and the alternative — appending to a file
+// per iteration — would put a flash erase inside the measurement window
+// of whichever press came next. Flash writes stall the cache and
+// therefore both cores, so one write at the end is not a convenience,
+// it's the only placement that doesn't corrupt the data being collected.
+static RunSample runSamples[AUTO_TEST_ITERATIONS];
+static uint16_t runCount = 0;     // samples collected in the run so far
+static bool runRecording = false; // drop samples from ordinary manual presses
+static bool runAborted = false;   // the run was stopped by a press, not finished
+// Set when a run ends and cleared once the file is out. Deferred rather
+// than written on the spot because an abort can land mid-measurement:
+// the press that stops a run is handled on core 1 while core 0 may still
+// be timing the previous one, and that last sample belongs in the file.
+// See serviceAutoTest(), which flushes as soon as the board reports no
+// measurement outstanding.
+static bool runFlushPending = false;
+// True only when the run ended with one of its own measurements still
+// running — i.e. it was aborted mid-press. It is what stops the flush
+// from waiting on, and then swallowing, a measurement belonging to some
+// manual press the user made in the meantime: a run that ended normally
+// already collected its last sample, so it never waits at all.
+static bool runAwaitSample = false;
+// The gap this press was preceded by, remembered from when it was rolled
+// so it can be paired with the measurement that comes back.
+static uint16_t runGapMs = 0;
+
+// The board's half of a sample, handed up from its measurement code on
+// core 0. One slot, not a queue: a measurement is strictly one at a time
+// (the run won't start the next press until boardMeasurementBusy() goes
+// false), and the board sets this before it drops that flag — so by the
+// time core 1 is allowed to look, the value is already here. Same
+// handover as boardShowPress()'s pressMicros, in the other direction.
+static volatile uint32_t sampleLatencyUs = 0;
+static volatile bool sampleRise = false;
+static volatile bool sampleTimedOut = false;
+static volatile bool sampleReady = false;  // set on core 0, cleared on core 1
+
 // Captured once, at the press edge, rather than re-checked live: if a
 // hold is the one that opens the menu partway through (crossing
 // MENU_HOLD_MS below), its own eventual release must still read as an
@@ -243,6 +290,40 @@ void appAdvancePendingMode() {
   doAdvancePendingMode(false);
 }
 
+// The board's half of one sample, arriving from its measurement code on
+// core 0 the instant a measurement resolves — before the board drops the
+// flag boardMeasurementBusy() reports, which is what makes it safe for
+// core 1 to read this the moment it sees that flag clear.
+//
+// Every measurement lands here, including the manual presses that have
+// nothing to do with a run. Nothing is filtered out at this end: the
+// stash is a single slot that the next press overwrites anyway, and only
+// the run sequencer below ever promotes one into the buffer. That keeps
+// this function to four stores, which matters because it runs on the
+// same core, and in the same breath, as the measurement itself.
+void appRecordSample(uint32_t latencyUs, bool rise, bool timedOut) {
+  sampleLatencyUs = latencyUs;
+  sampleRise = rise;
+  sampleTimedOut = timedOut;
+  sampleReady = true;
+}
+
+// Move whatever the board left in the stash into the run's buffer,
+// pairing it with the gap this press was preceded by — the half of a
+// sample only this file knows. Core 1 only, and only ever with no
+// measurement outstanding.
+static void collectSample() {
+  if (!sampleReady) return;  // e.g. a measurement the hold ceiling gave up on
+  sampleReady = false;
+  if (!runRecording || runCount >= AUTO_TEST_ITERATIONS) return;
+
+  RunSample &s = runSamples[runCount++];
+  s.latencyUs = sampleLatencyUs;
+  s.gapMs = runGapMs;
+  s.rise = sampleRise;
+  s.timedOut = sampleTimedOut;
+}
+
 // Random rather than fixed, and this is the whole point of the gap: a
 // constant interval can alias with the display's refresh cadence, parking
 // every press at the same phase within a frame and quietly biasing the
@@ -256,18 +337,67 @@ static void stopAutoTest() {
   // If the run was aborted mid-press, release — otherwise the host is
   // left holding a button nobody is pressing.
   if (autoPhase == AUTO_HOLDING) sendRelease();
+  // Aborting mid-press leaves that press's measurement running on the
+  // other core; its result is a perfectly good sample and the file waits
+  // for it.
+  runAwaitSample = (autoPhase == AUTO_HOLDING);
   autoPhase = AUTO_OFF;
   boardShowAutoTest(0, 0);
+  // Everything collected so far still gets written out; an aborted run
+  // is usually the interesting one (you stopped it because you saw
+  // something), so throwing its samples away would be exactly backwards.
+  // The write itself waits — see runFlushPending, and finishRun() below.
+  runAborted = true;
+  runFlushPending = true;
 }
 
 void appStartAutoTest() {
   autoStartRequested = true;
 }
 
+// The one place a run's file is written. Deliberately not called from
+// wherever a run happens to end: an abort is handled on core 1 at the
+// press edge, which can be partway through core 0's measurement of the
+// previous press, and that sample belongs in the file. So the end of a
+// run only raises runFlushPending, and this waits for the board to
+// report nothing outstanding before collecting the straggler and
+// writing.
+//
+// The write blocks for as long as flash takes — tens of milliseconds,
+// maybe more — and that is fine precisely here and nowhere else: the run
+// is over, no measurement can be in flight, and the worst it costs is a
+// button press going unnoticed while a file that is already fully
+// determined gets stored.
+static void finishRun() {
+  if (runAwaitSample) {
+    if (boardMeasurementBusy()) return;
+    collectSample();
+    runAwaitSample = false;
+  }
+
+  runFlushPending = false;
+  runRecording = false;
+
+  RunRecord rec;
+  rec.mode = activeMode;
+  rec.planned = AUTO_TEST_ITERATIONS;
+  rec.count = runCount;
+  rec.aborted = runAborted;
+  rec.samples = runSamples;
+  boardWriteRun(rec);
+}
+
 // Drives the automated run. Called every loop() pass, including while
 // the button is released — which is the normal case, since a run happens
 // with nobody touching the device.
 static void serviceAutoTest(uint32_t now) {
+  // Before anything else: a run that has ended still owes a file, and
+  // nothing new may start until it's out.
+  if (runFlushPending) {
+    finishRun();
+    if (runFlushPending) return;
+  }
+
   if (autoStartRequested) {
     // Wait for the button to come up first. The menu item that requests
     // a run is itself selected by a 1s hold, so the button is still down
@@ -278,11 +408,16 @@ static void serviceAutoTest(uint32_t now) {
     autoStartRequested = false;
     autoDone = 0;
     autoPhase = AUTO_GAP;
+    runCount = 0;
+    runAborted = false;
+    runRecording = true;
+    sampleReady = false;  // anything left over belongs to a manual press
     // A normal gap before the first press too, rather than firing the
     // instant the button comes up: the button is the screen face, inches
     // from wherever the sensor is aimed, so letting go of it is exactly
     // the moment not to be taking a reading.
-    autoResumeAtMs = now + autoGapMs();
+    runGapMs = autoGapMs();
+    autoResumeAtMs = now + runGapMs;
     boardShowAutoTest(0, AUTO_TEST_ITERATIONS);
   }
 
@@ -301,6 +436,10 @@ static void serviceAutoTest(uint32_t now) {
         sendPress();
         boardShowPress(true, activeMode, edgeMicros);
       }
+      // runGapMs is already the gap that just elapsed (rolled when this
+      // phase was entered); it stays put until the next one is rolled, so
+      // the measurement about to come back is paired with the right one.
+      sampleReady = false;
       autoPressedAtMs = now;
       autoPhase = AUTO_HOLDING;
       return;
@@ -316,12 +455,21 @@ static void serviceAutoTest(uint32_t now) {
       boardShowPress(false, activeMode, esp_timer_get_time());
       autoDone++;
 
+      // Getting here means the measurement is done (or the hold ceiling
+      // gave up on it, in which case there is nothing to collect and the
+      // iteration simply contributes no row) — so the board's half of
+      // this sample is already in the stash, still paired with the gap
+      // that preceded this press.
+      collectSample();
+
       if (autoDone >= AUTO_TEST_ITERATIONS) {
         autoPhase = AUTO_OFF;
         boardShowAutoTest(0, 0);
+        runFlushPending = true;  // written on the next pass, by finishRun()
       } else {
         autoPhase = AUTO_GAP;
-        autoResumeAtMs = now + autoGapMs();
+        runGapMs = autoGapMs();
+        autoResumeAtMs = now + runGapMs;
         boardShowAutoTest(autoDone, AUTO_TEST_ITERATIONS);
       }
       return;

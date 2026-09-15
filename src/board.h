@@ -134,3 +134,66 @@ void appAdvancePendingMode();
 // HID report or it isn't measuring the same thing. A board with no menu
 // never calls this.
 void appStartAutoTest();
+
+// --- Recording an automated run ----------------------------------------
+// Every automated run is written out as a CSV file on the board's flash
+// filesystem, so a distribution can be looked at properly afterwards
+// instead of being read off a 128x128 screen while it happens. (A
+// follow-up exposes that filesystem over USB MSC; the on-flash format is
+// chosen with that in mind — see board_atoms3r.cpp.)
+//
+// The two halves of a sample are known by different owners, which is the
+// whole reason this needs a contract rather than one file doing it all:
+// main.cpp paces the run and therefore knows the gap it left before each
+// press, while the board did the measuring and therefore knows what came
+// back. The board pushes its half up through appRecordSample() below,
+// main.cpp joins the two and buffers the result in RAM, and the finished
+// run comes back down to boardWriteRun() to be stored.
+//
+// Nothing here writes to flash while a run is in progress, and that is
+// not an implementation detail to be optimised away later: an erase or a
+// program cycle stalls the flash cache, which stalls code execution on
+// *both* cores, which would land squarely inside some other iteration's
+// measurement. One write, after the last sample is in.
+struct RunSample {
+  uint32_t latencyUs;  // meaningless, and not written out, when timedOut
+  uint16_t gapMs;      // idle time main.cpp left before this press
+  bool rise;           // true = the sensor crossed the threshold upward
+  bool timedOut;       // nothing crossed before the board gave up
+};
+
+// A whole run, as handed to the board for storage. `planned` is the
+// iteration count the run set out to do and `count` is how many samples
+// actually came back, so the two differing is the interesting part: a
+// run stopped early has aborted set, and a run that finished can still
+// be short by the odd sample a wedged measurement swallowed.
+struct RunRecord {
+  Mode mode;                   // the USB identity every sample was taken in
+  uint16_t planned;            // iterations the run set out to do
+  uint16_t count;              // samples actually collected
+  bool aborted;                // stopped early by a press
+  const RunSample *samples;    // count entries, oldest first
+};
+
+// Store a finished (or aborted) run. Called from loop() on core 1 once
+// the run is over and no measurement is outstanding — never during one.
+// Expected to block for as long as the write takes; there is nothing
+// left to disturb by then, which is exactly why the call is deferred to
+// this point rather than made per sample.
+//
+// A board with no filesystem — and, having no sensor, no way to have
+// produced a sample in the first place — does nothing here.
+void boardWriteRun(const RunRecord &run);
+
+// Implemented in main.cpp; called by the board's measurement code as
+// soon as a measurement resolves, and before the board drops the busy
+// flag boardMeasurementBusy() reports — so a run that is waiting for
+// that flag can rely on the sample already being there.
+//
+// Called for every measurement, including the manual presses that have
+// nothing to do with a run; main.cpp drops the ones that arrive while no
+// run is in progress. Keeping the filter there rather than here is what
+// lets the board layer stay ignorant of runs entirely.
+//
+// latencyUs is meaningless when timedOut is true.
+void appRecordSample(uint32_t latencyUs, bool rise, bool timedOut);

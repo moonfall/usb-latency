@@ -79,6 +79,15 @@
  * all (see main.cpp) — every press is menu input until MENU_TOP's Exit,
  * or MENU_MODE's confirm, returns menuState to MENU_NONE.
  *
+ * Every automated run started from that menu is also written out, as one
+ * CSV file per run on the board's `ffat` partition — see the run-storage
+ * block below for the format and boardWriteRun() for the write itself.
+ * Nothing is written while a run is going: this file's half of each
+ * sample goes up to main.cpp through appRecordSample(), main.cpp buffers
+ * the whole run in RAM, and the file is written once at the end. A flash
+ * erase stalls the cache and therefore code execution on both cores, so
+ * a per-sample write would land inside some other sample's measurement.
+ *
  * NOTHING here draws from loop(). All panel access, all ADC sampling and
  * the whole measurement loop happen in one task pinned to core 0
  * (`uiTaskFn`), while loop() runs on core 1 — so none of it can stretch a
@@ -103,7 +112,11 @@
  */
 
 #include <Arduino.h>
+#include <stdarg.h>
+
+#include <FFat.h>
 #include <M5GFX.h>
+#include <Preferences.h>
 #include <esp_timer.h>
 
 #include "board.h"
@@ -145,6 +158,47 @@ static const uint32_t MEASURE_TIMEOUT_MS = 500;
 #define HIST_CAPACITY 500
 #endif
 
+// --- Run storage -------------------------------------------------------
+// Finished automated runs are written to the `ffat` partition (see
+// partitions_atoms3r_8MB.csv) as one CSV file each. FAT rather than
+// LittleFS/SPIFFS on purpose: a follow-up exposes this partition raw
+// over USB MSC, so the host mounts the flash itself and reads the files
+// with no firmware in the loop — which only works if what's down there
+// really is a FAT volume. That also fixes the naming: 8.3, uppercase,
+// no long-filename entries.
+//
+// One file looks like this:
+//
+//   # usb-latency run 42
+//   # mode,GAMEPAD
+//   # planned,500
+//   # recorded,500
+//   # aborted,no
+//   seq,gap_ms,dir,latency_us,status
+//   1,342,R,24381,ok
+//   2,208,F,41002,ok
+//   3,455,R,,timeout
+//
+// The mode is a metadata line rather than a sixth column repeated 500
+// times: it is a property of the run, not of a sample, and every reader
+// worth using (pandas' comment='#', R's read.csv(comment.char='#'))
+// skips the '#' block for free. latency_us is left empty on a timeout
+// and the reason moves to `status`, so the column stays purely numeric
+// instead of needing a sentinel parsed out of it. dir is R or F, the
+// same rise/fall split the on-screen stats keep — see the file header
+// on why that distinction is worth carrying all the way to the file.
+static const char *RUN_PREFS_NAMESPACE = "runlog";  // separate from main.cpp's "usbmode"
+static const char *RUN_PREFS_KEY = "next";
+// Filenames are RUNnnnnn.CSV, so the counter has to wrap before it needs
+// a sixth digit or it would stop being 8.3. 99999 runs at three to five
+// minutes each is several years of continuous testing; wrapping (and
+// overwriting) is a better failure than silently writing RUN100000.CSV
+// and having FAT mangle it into something with a tilde in.
+static const uint32_t RUN_NUMBER_WRAP = 100000;
+// How much of a run file to accumulate before handing it to FatFS. See
+// runEmit() below for why the file isn't written a row at a time.
+static const size_t RUN_WRITE_CHUNK = 1024;
+
 // --- Layout (the panel is 128x128) -------------------------------------
 static const int SCREEN_W = 128;
 static const int TOP_TEXT_Y = 0;    // Font2, 16 tall
@@ -162,6 +216,10 @@ static const int HIST_LABEL_Y = HIST_TOP + HIST_H + 2;
 static M5GFX display;
 static bool displayReady = false;
 static TaskHandle_t uiTask = nullptr;
+// Set once by the UI task at boot, read by boardWriteRun() on core 1.
+// Mounting is the only thing that ever touches it, and that happens long
+// before any run can be started from the menu.
+static volatile bool storageReady = false;
 
 // Written from loop() (core 1), read by uiTask (core 0). All are single
 // aligned words, so a torn read isn't possible; the task re-reads them
@@ -292,10 +350,21 @@ static void runMeasurement(int64_t t0) {
         statsFall.record(us);
         histFall.push(us);
       }
+      // Third destination for the same sample, after the running stats
+      // and the histogram: main.cpp, which pairs it with the gap that
+      // preceded the press and buffers it for the run's file. Handing it
+      // over from in here rather than from the caller is what guarantees
+      // it lands before measureBusy drops — see board.h.
+      appRecordSample(us, waitForRise, false);
       return;
     }
     if (now >= deadline) {
       lastLatencyUs = LAT_TIMEOUT;
+      // A timeout is a result, not a missing one: which direction was
+      // being waited for is still worth recording, because a run full of
+      // timeouts in one direction says something quite different from a
+      // run full of them in both.
+      appRecordSample(0, waitForRise, true);
       return;
     }
   }
@@ -614,6 +683,21 @@ static void uiTaskFn(void *) {
   if (displayReady) display.setBrightness(BRIGHTNESS);
   analogSetPinAttenuation(LIGHT_ANALOG_PIN, ADC_11db);  // full ~0-3.3V span
 
+  // Mount here and nowhere else. This is the one moment in the firmware's
+  // life when a flash operation is harmless: USB is already up (main.cpp
+  // called USB.begin() before boardShowBoot() started this task), nothing
+  // has been pressed yet, and no measurement can be running. Doing it in
+  // setup() would put it before USB.begin(); doing it lazily on the first
+  // run would put an erase inside a measurement window.
+  //
+  // formatOnFail: a device flashed with this partition table for the
+  // first time has an `ffat` partition full of whatever was there before,
+  // which will not mount — so the first boot formats it, once, and every
+  // boot after that mounts in milliseconds. Note the consequence for that
+  // first boot only: the screen stays black for however long the format
+  // takes, because this task is the one that draws.
+  storageReady = FFat.begin(true);
+
   // What the screen currently shows, so only real changes are repainted.
   Mode shownActive = MODE_COUNT;  // MODE_COUNT != any real mode, forcing
   Mode shownPending = MODE_COUNT; // the first pass to draw a full frame
@@ -800,6 +884,93 @@ void boardShowAutoTest(uint16_t done, uint16_t total) {
   autoDone = done;
   autoTotal = total;
   nudgeUi();
+}
+
+// Allocate this run's file number. Bumped before the file is written
+// rather than after: losing a number to a failed write costs nothing,
+// whereas handing the same number out twice would have the second run
+// silently overwrite the first.
+static uint32_t nextRunNumber() {
+  Preferences runPrefs;
+  // A namespace of its own rather than another key in main.cpp's
+  // "usbmode": that one is owned by the mode state machine on core 1 and
+  // this is written from core 1 too, but by an unrelated feature — and
+  // separate namespaces mean an erase of either can never take the other
+  // with it.
+  if (!runPrefs.begin(RUN_PREFS_NAMESPACE, false)) return 0;
+  uint32_t n = runPrefs.getUInt(RUN_PREFS_KEY, 0);
+  runPrefs.putUInt(RUN_PREFS_KEY, (n + 1) % RUN_NUMBER_WRAP);
+  runPrefs.end();
+  return n;
+}
+
+// Rows are built up in this buffer and written in batches rather than one
+// f.print() per line: every write is a VFS + FatFS round trip, and 500 of
+// them is 500 chances to touch flash where a handful would do. File scope
+// rather than a local so a kilobyte of it isn't sitting on loop()'s
+// stack; boardWriteRun() below is the only caller, and it is called from
+// one core at a time with no run in progress, so there is nothing to
+// share it with.
+static char runBuf[RUN_WRITE_CHUNK + 64];
+static size_t runBufUsed = 0;
+
+static void runFlush(File &f) {
+  if (runBufUsed == 0) return;
+  f.write((const uint8_t *)runBuf, runBufUsed);
+  runBufUsed = 0;
+}
+
+static void runEmit(File &f, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(runBuf + runBufUsed, sizeof(runBuf) - runBufUsed, fmt, ap);
+  va_end(ap);
+  if (n > 0) runBufUsed += (size_t)n;
+  // The slack past RUN_WRITE_CHUNK is what makes this safe to check
+  // after the fact rather than before: a row is a few dozen bytes and the
+  // buffer has 64 spare, so the longest possible row still fits whatever
+  // the previous flush left behind.
+  if (runBufUsed >= RUN_WRITE_CHUNK) runFlush(f);
+}
+
+// Write a finished run out as RUNnnnnn.CSV. Called from loop() on core 1
+// with the run already over and no measurement outstanding (main.cpp's
+// finishRun() guarantees both), so this is free to block for as long as
+// the flash takes.
+void boardWriteRun(const RunRecord &run) {
+  if (!storageReady || run.count == 0) return;
+
+  uint32_t number = nextRunNumber();
+  char path[16];  // "/RUN99999.CSV" plus NUL, comfortably
+  snprintf(path, sizeof(path), "/RUN%05u.CSV", (unsigned)number);
+
+  File f = FFat.open(path, FILE_WRITE);
+  if (!f) return;
+  runBufUsed = 0;
+
+  runEmit(f, "# usb-latency run %u\n", (unsigned)number);
+  runEmit(f, "# mode,%s\n", modeName(run.mode));
+  runEmit(f, "# planned,%u\n", (unsigned)run.planned);
+  runEmit(f, "# recorded,%u\n", (unsigned)run.count);
+  runEmit(f, "# aborted,%s\n", run.aborted ? "yes" : "no");
+  runEmit(f, "seq,gap_ms,dir,latency_us,status\n");
+
+  for (uint16_t i = 0; i < run.count; i++) {
+    const RunSample &s = run.samples[i];
+    if (s.timedOut) {
+      // latency_us deliberately left empty rather than filled with a
+      // sentinel, so the column parses as a number everywhere and the
+      // reason lives in `status` instead.
+      runEmit(f, "%u,%u,%c,,timeout\n", (unsigned)(i + 1), (unsigned)s.gapMs,
+              s.rise ? 'R' : 'F');
+    } else {
+      runEmit(f, "%u,%u,%c,%u,ok\n", (unsigned)(i + 1), (unsigned)s.gapMs,
+              s.rise ? 'R' : 'F', (unsigned)s.latencyUs);
+    }
+  }
+
+  runFlush(f);
+  f.close();
 }
 
 bool boardMenuActive() {

@@ -106,3 +106,13 @@ void boardShowPending(Mode active, Mode pending, bool firstOfHold) {
   }
   showModeColor(pending);
 }
+
+// No sensor means no sample ever reaches main.cpp from here, and no menu
+// means no automated run can be started in the first place — so this can
+// only ever be called with an empty run, and there is no filesystem on
+// this board's 4MB layout to put one in anyway. Same shape as the menu
+// no-ops above: present to satisfy the shared board.h contract that
+// board_atoms3r.cpp implements for real.
+void boardWriteRun(const RunRecord &run) {
+  (void)run;
+}

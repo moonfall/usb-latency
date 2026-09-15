@@ -1,0 +1,41 @@
+# Partition table for env:m5stack-atoms3r (AtomS3R, 8MB flash).
+#
+# Why a custom table at all: the automated test writes one CSV file per
+# run, and those files have to live on a genuine FAT filesystem — a
+# follow-up task exposes this exact partition raw over USB MSC, so the
+# host mounts the flash itself and reads the files with no firmware in
+# the loop. That rules out LittleFS/SPIFFS, and the stock default_8MB.csv
+# ships a `spiffs` partition, so the table has to be ours.
+#
+# Constraints this layout is pinned by, in order:
+#
+#   nvs at 0x9000, 0x5000   Unchanged from default_8MB.csv on purpose.
+#                           The mode selection (and now the run counter)
+#                           live in NVS, and reflashing with a table that
+#                           moved or resized nvs would silently reset a
+#                           device back to gamepad mode. Keeping the
+#                           offset AND the size identical is what lets an
+#                           existing device take this firmware without
+#                           losing its persisted state.
+#
+#   one factory app, 4MB    No OTA: this board is flashed over USB, and
+#                           two app slots would cost 4MB for a feature
+#                           nothing uses. 4MB is deliberately generous —
+#                           the current firmware is well under 1MB, but a
+#                           later task adds a BLE stack, which is worth
+#                           roughly a megabyte of it on its own.
+#
+#   ffat, the rest          ~3.9MB of wear-levelled FAT. A run file is
+#                           about 12KB (500 rows), so that is thousands
+#                           of runs before the oldest need deleting.
+#
+#   coredump at the end     Same 64KB at the same place the stock tables
+#                           put it, so a panic dump still lands somewhere
+#                           the standard tooling looks.
+#
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x5000,
+otadata,    data, ota,      0xe000,   0x2000,
+factory,    app,  factory,  0x10000,  0x400000,
+ffat,       data, fat,      0x410000, 0x3E0000,
+coredump,   data, coredump, 0x7F0000, 0x10000,

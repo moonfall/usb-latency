@@ -54,6 +54,13 @@ report or it isn't measuring the same thing. It does **not** clear the
 existing stats first — reset with a 1s hold beforehand if a clean
 distribution is wanted.
 
+Every run is recorded to flash, on the AtomS3R only: one CSV file per
+run on a wear-levelled FAT partition, named `RUNnnnnn.CSV` from a counter
+kept in NVS. Aborted runs are written too, with whatever they collected.
+Nothing is written while a run is in progress — see the
+no-flash-writes-during-a-run gotcha below, and the run-storage block in
+`board_atoms3r.cpp` for the file format.
+
 ## Build
 
 ```
@@ -71,9 +78,20 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `USBCDC` in `src/main.cpp` (`USBSerial`) is begun explicitly instead, so
   Serial-style debug output over USB is still available). The two envs then
   differ only in `board`, `build_src_filter` (which `board_*.cpp` gets
-  compiled), and — for the AtomS3R — a `lib_deps` on M5GFX. Both envs
-  restate their board profile's `extra_flags` minus `ARDUINO_USB_MODE=1`,
-  which would otherwise redefine the `=0` set above.
+  compiled), `board_build.partitions`, and — for the AtomS3R — a
+  `lib_deps` on M5GFX. Both envs restate their board profile's
+  `extra_flags` minus `ARDUINO_USB_MODE=1`, which would otherwise
+  redefine the `=0` set above.
+- `partitions_atoms3r_8MB.csv` — the AtomS3R's partition table, replacing
+  the AtomS3 board profile's stock `default_8MB.csv` (which has a SPIFFS
+  partition this project can't use). `nvs` stays at `0x9000`/`0x5000`,
+  byte-for-byte where the stock table puts it, so reflashing an existing
+  device doesn't lose its persisted mode; then a single 4MB `factory` app
+  at `0x10000` (no OTA — generous on purpose, a later task adds a BLE
+  stack), `ffat` filling `0x410000`-`0x7F0000`, and `coredump` in the last
+  64KB where the stock tables keep it. The S3-Zero env has 4MB, no sensor
+  and therefore no automated test, so it keeps stock `default.csv` and
+  stores nothing.
 - `src/main.cpp` — board-independent core: the mode state machine, NVS
   persistence, the single HID device, and the debounce loop. The button
   drives exactly one of three USB HID device modes at a time: gamepad "X"
@@ -110,7 +128,13 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `boardMenuActive()`, `boardEnterMenu()`, `boardMenuTap()`,
   `boardMenuSelect()`, and `appAdvancePendingMode()` (the one function
   that runs the other way: implemented in `main.cpp`, called by the
-  board's mode-picker submenu). main.cpp owns the normal-operation
+  board's mode-picker submenu). Run recording adds `RunSample`/`RunRecord`
+  plus one function each way: `appRecordSample()` (board → `main.cpp`,
+  one measurement's latency/direction/timeout as soon as it resolves) and
+  `boardWriteRun()` (`main.cpp` → board, the whole buffered run, once,
+  after it ends). The split follows who knows what — `main.cpp` paces the
+  run and so owns the mode, the iteration count and the gap before each
+  press; the board did the measuring and so owns the result. main.cpp owns the normal-operation
   ladder's timing and pushes the resulting hint down, so the board
   renders a label and never duplicates a threshold; it also decides, once
   per press edge via `boardMenuActive()`, whether that press is HID input
@@ -118,7 +142,9 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   are no board `#ifdef`s in `main.cpp` and nothing in the board layer
   touches USB. Mode state is passed in rather than duplicated there.
 - `src/board_s3zero.cpp` — ESP32-S3-Zero: BOOT button (GPIO0, active-low),
-  onboard WS2812 (GPIO21). The LED lights up while the button is held, in a
+  onboard WS2812 (GPIO21). No sensor, no menu, no filesystem, so the
+  measurement, menu and run-storage halves of the contract are all no-ops
+  here. The LED lights up while the button is held, in a
   colour identifying the active mode (red/green/blue). Once a hold crosses
   `MODE_HOLD_MS`, it flashes white for `MODE_SWITCH_FLASH_MS` (500ms) to
   mark the first mode change in that hold, then shows the new pending
@@ -166,11 +192,36 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   going dark both work off one threshold value. The poll is tight and
   unyielding (`analogRead()` is tens of µs, so it resolves far finer than
   a millisecond), bounded by `MEASURE_TIMEOUT_MS` (500ms) — see the
-  core-0-starvation gotcha below. Every successful measurement is recorded
-  twice: into a `DirStats` (running count/min/mean) and into a `History`
-  ring buffer (the last `HIST_CAPACITY` raw values) — one per direction,
-  kept separate rather than pooled. See the direction-bucketing gotcha
-  below for why.
+  core-0-starvation gotcha below. Every measurement goes to three places:
+  a `DirStats` (running count/min/mean), a `History` ring buffer (the last
+  `HIST_CAPACITY` raw values) — one of each per direction, kept separate
+  rather than pooled, see the direction-bucketing gotcha below for why —
+  and up to `main.cpp` via `appRecordSample()`, which is what puts it in
+  a run's file if a run is going.
+
+  It also owns run storage: the `ffat` partition is mounted (formatting it
+  if this is a fresh flash) inside `uiTaskFn` at startup, and
+  `boardWriteRun()` writes one CSV per automated run. File numbers come
+  from a counter in its own `Preferences` namespace (`runlog`/`next`),
+  separate from `main.cpp`'s `usbmode`. Format — a `#` metadata block,
+  then a header row, then one row per iteration:
+
+  ```
+  # usb-latency run 42
+  # mode,GAMEPAD
+  # planned,500
+  # recorded,500
+  # aborted,no
+  seq,gap_ms,dir,latency_us,status
+  1,342,R,24381,ok
+  3,455,R,,timeout
+  ```
+
+  The mode is a metadata line rather than a column repeated 500 times
+  (it's a property of the run, and `#` is the comment character every
+  sane CSV reader already takes); `latency_us` is left *empty* on a
+  timeout with the reason moved to `status`, so the column stays purely
+  numeric instead of carrying a sentinel to be parsed out.
 
 ## Gotchas already hit
 
@@ -405,3 +456,57 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   randomised too rather than firing immediately, because the button *is*
   the screen face, inches from wherever the sensor is aimed: the instant
   the user lets go of it is exactly the wrong time to take a reading.
+- **No flash write may happen while a run is in progress — and this is
+  not a performance nicety.** An erase or program cycle on the ESP32-S3's
+  SPI flash stalls the flash cache, which stalls instruction fetch on
+  *both* cores, not just the one doing the writing. `runMeasurement()`
+  polls an ADC in a tight loop on core 0 and `loop()` watches the button
+  on core 1; a multi-millisecond cache stall in the middle of either one
+  lands directly in the number the tool exists to measure. So the whole
+  run is buffered in RAM (`runSamples[]` in `main.cpp` — 500 samples is
+  4KB against 320KB, i.e. nothing) and written exactly once, after the
+  last sample. The same reasoning is why the `ffat` mount happens during
+  `uiTaskFn`'s startup rather than lazily on first use: boot is the one
+  moment when nothing is being timed.
+- **Storage is FFat (wear-levelled FAT), not LittleFS or SPIFFS, and that
+  choice is load-bearing.** A follow-up exposes the `ffat` partition raw
+  over USB MSC, so the host mounts the flash itself and reads run files
+  with no firmware in the loop — which only works if what's down there is
+  a genuine FAT volume. Consequences worth remembering: filenames are 8.3
+  and uppercase (`RUN00042.CSV` — a long name would cost VFAT entries and
+  get mangled), and the run counter wraps at 99999 rather than growing a
+  sixth digit.
+- **Don't move or resize the `nvs` partition.** `partitions_atoms3r_8MB.csv`
+  keeps it at `0x9000`, size `0x5000`, identical to the stock
+  `default_8MB.csv` the AtomS3 board profile ships. That's what lets an
+  existing device be reflashed with the new table and still come up in the
+  mode it was left in — the mode selection, and now the run counter, both
+  live in NVS. A table that shifted `nvs` by even one sector would
+  silently reset every device back to gamepad mode, and it would look like
+  a firmware bug rather than a partitioning one.
+- **The `ffat` partition is formatted on first mount, and the screen is
+  black while that happens.** `FFat.begin(true)` — format-on-fail — is
+  required, not optional: a device flashed with this table for the first
+  time has whatever the old SPIFFS partition left behind at `0x410000`,
+  which will not mount as FAT. The format runs inside `uiTaskFn`, and that
+  task is also the one that draws, so the very first boot after reflashing
+  shows nothing until it finishes. One-off, not a hang.
+- **`appRecordSample()` must be called before the board drops
+  `measureBusy`, not after.** It's the same handover as `pressMicros` in
+  the other direction: the automated test on core 1 waits for
+  `boardMeasurementBusy()` to go false and then reads the sample the UI
+  task left for it, so "result stored, *then* flag cleared" is the entire
+  synchronisation. Calling it from `uiTaskFn` after `runMeasurement()`
+  returns would look equivalent and would race — which is why the calls
+  live at `runMeasurement()`'s own two exit points instead.
+- **A run stopped mid-press still has a measurement running on the other
+  core, so the file write is deferred rather than done at the abort.** The
+  abort is handled on core 1 at the press edge, which can be tens of
+  milliseconds into core 0's measurement of the previous press — a
+  perfectly good sample that belongs in the file. `stopAutoTest()`
+  therefore only raises `runFlushPending` (plus `runAwaitSample`, if the
+  run was in its holding phase), and `finishRun()` waits for the board to
+  report nothing outstanding before collecting the straggler and writing.
+  `runAwaitSample` is what keeps that wait from swallowing a measurement
+  belonging to some *manual* press made in the meantime: a run that ended
+  normally already has its last sample, so it never waits at all.
