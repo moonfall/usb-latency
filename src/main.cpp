@@ -1,9 +1,23 @@
 /*
- * USB HID Gamepad / Keyboard / Mouse (single active device), or a drive
+ * HID Gamepad / Keyboard / Mouse over USB or BLE (one identity at a
+ * time), or a drive
  * -------------------------------------------------------------------------
- * Emulates exactly ONE USB HID device at a time — gamepad ("X" button),
- * keyboard (Space), or mouse (left click) — selected by the board's one
- * button:
+ * Emulates exactly ONE HID device at a time — gamepad ("X" button),
+ * keyboard (Space), or mouse (left click) — over either USB or Bluetooth
+ * LE, selected by the board's one button:
+ *
+ * The six identities are three actions times two transports, and that is
+ * the whole reason the BLE half exists: the point is to compare BLE input
+ * latency against USB with the same instrument, the same button, the same
+ * sensor and the same statistics, so the only thing that differs between
+ * a MODE_KEYBOARD number and a MODE_BLE_KEYBOARD one is how the report
+ * got to the host. Everything downstream of sendPress() — the
+ * measurement, the stats, the histogram, the automated test, the run
+ * files — is transport-blind by construction. See the BLE block below for
+ * how a BLE mode differs on the way in: USB is CDC-only (no HID device is
+ * constructed at all), and the report becomes a HID-over-GATT
+ * notification to a bonded host.
+ *
  * On a board with a sensor (a screen to put a menu on), the button works
  * in two entirely different ways depending on whether the menu is open:
  *
@@ -20,8 +34,9 @@
  *     - Hold 1s: trigger the highlighted item's action.
  *   The menu holds the light meter (a live view, toggled instantly),
  *   the automated test (see appStartAutoTest()), arming the USB drive
- *   (see appSetStorageArmed()) and changing the pending mode (see
- *   appAdvancePendingMode()). The first and last used to be hold-ladder
+ *   (see appSetStorageArmed()), changing the pending mode (see
+ *   appAdvancePendingMode()) and — in a BLE mode only — pairing (see
+ *   appBlePairingMode()). The first and last used to be hold-ladder
  *   rungs of their own; moving them into a proper menu is what let
  *   short-press-to-advance and hold-to-select behave the same way at
  *   every level, instead of every feature inventing its own hold
@@ -43,10 +58,10 @@
  * MODE_HOLD_MS (3s) for as long as it's held.
  *
  * Note what is NOT part of any of this: the light meter is not a Mode. A
- * Mode is a USB identity, which is why it's stuck until a reboot — and
- * the meter touches no USB state whatsoever, so tying it to one would
- * have cost a reboot for nothing. It's a view the board layer flips at
- * runtime. (Outside the menu, presses keep sending their HID report
+ * Mode is a host-facing identity, which is why it's stuck until a reboot
+ * — and the meter touches neither USB nor the radio, so tying it to one
+ * would have cost a reboot for nothing. It's a view the board layer
+ * flips at runtime. (Outside the menu, presses keep sending their HID report
  * while the meter view is up, which is exactly what you want when aiming
  * the sensor: press the button, watch the thing you're pointing at
  * change, and watch the bar move. Inside the menu, no press sends HID at
@@ -81,7 +96,15 @@
  *                        is shown permanently on the 128x128 LCD.
  *
  * Nothing below this point is board-specific, and nothing in board_*.cpp
- * touches USB.
+ * touches USB or the radio.
+ *
+ * A BLE mode is the same shape of thing for the same reason, just one
+ * layer out: the GATT database, the report map and the advertised
+ * identity are built once, in setup(), from the mode read out of NVS, and
+ * NimBLE offers no more of a way to swap a HID report descriptor under a
+ * bonded host than TinyUSB does under an enumerated one. So all six modes
+ * share one rule — the identity is decided before anything is brought up,
+ * and changing it is a reboot.
  *
  * Why a reboot at all, and why it must be manual: the ESP32 Arduino
  * core's TinyUSB HID wrapper registers a device's report descriptor
@@ -134,6 +157,8 @@
 #include <Preferences.h>
 #include <esp_random.h>
 #include <esp_timer.h>
+#include <NimBLEDevice.h>
+#include <NimBLEHIDDevice.h>
 #include <USB.h>
 #include <USBCDC.h>
 #include <USBHIDGamepad.h>
@@ -287,21 +312,444 @@ static volatile bool sampleReady = false;  // set on core 0, cleared on core 1
 static bool wasMenuActiveAtPress = false;
 static bool menuActionTaken = false;  // this hold already triggered the highlighted item
 
-static inline void sendPress() {
-  switch (activeMode) {
-    case MODE_GAMEPAD:  gamepad->pressButton(BUTTON_X); break;
-    case MODE_KEYBOARD: keyboard->press(' '); break;
-    case MODE_MOUSE:    mouse->press(MOUSE_LEFT); break;
-    default: break;
+// --- Bluetooth LE HID -------------------------------------------------
+// The three BLE modes are HID-over-GATT peripherals: the same three
+// actions the USB modes send, carried as notifications on an input
+// report characteristic instead of as reports on a USB endpoint.
+//
+// NimBLE and not the Arduino core's bundled `BLE` library, because the
+// choice isn't open — this platform's prebuilt IDF libraries are built
+// with CONFIG_BT_NIMBLE_ENABLED and no Bluedroid at all, so the host that
+// the bundled library (and every ESP32-BLE-Gamepad/Keyboard/Mouse
+// derivative) needs is simply not in libbt.a. NimBLEHIDDevice then gives
+// the whole HoGP service — report map, input report plus its report
+// reference descriptor, HID info, HID control point, protocol mode, and
+// the Device Information and Battery services hosts expect alongside it —
+// for the cost of handing it a report descriptor.
+//
+// Note what this shares with the USB half and what it doesn't. Shared:
+// exactly one identity per boot, chosen from NVS before anything is
+// brought up, so the GATT database contains one HID service with one
+// report map and the host sees a single-purpose device. Not shared: a BLE
+// mode still calls USB.begin(), because USBSerial is the only debug
+// channel this firmware has — it just constructs no HID class, so the
+// device enumerates as a plain CDC serial port and nothing else.
+
+// Report IDs. One per mode, and always 1: a boot only ever builds one of
+// the three report maps, so there is nothing for a second ID to
+// disambiguate. It is present rather than omitted because a report map
+// with no Report ID item and a report reference descriptor claiming ID 1
+// is the classic HoGP mismatch, and hosts differ on which they believe.
+static const uint8_t BLE_REPORT_ID = 1;
+
+// Longest report any of the three modes sends (the keyboard's 8). One
+// fixed buffer, filled in place on the press path, rather than a
+// per-mode struct: the send path must not allocate.
+static const size_t BLE_REPORT_MAX = 8;
+
+// Connection interval we ask the host for, in 1.25ms units: 7.5ms to
+// 15ms, slave latency 0, 2s supervision timeout. This is a real knob on
+// the number being measured and it is deliberately set rather than left
+// to the host's default, because it is what an actual BLE gamepad or
+// mouse asks for — a tester that accepted a 30-60ms default would be
+// measuring a device nobody ships. Two details matter more than the
+// interval itself:
+//
+//   - Slave latency MUST be 0. Nonzero latency lets the peripheral skip
+//     connection events when it has nothing to say, which is excellent
+//     for battery and ruinous for input lag, and it would show up here
+//     as a fat tail nothing in the firmware explains.
+//   - The host may simply refuse. These are a *request*; the connection
+//     interval the link actually settles on is the host's to decide, and
+//     the measurement includes whatever it picked either way. See the
+//     latency-honesty note further down: the wait for the next connection
+//     event is part of what BLE costs and is not subtracted anywhere.
+static const uint16_t BLE_CONN_ITVL_MIN = 6;   // 7.5ms
+static const uint16_t BLE_CONN_ITVL_MAX = 12;  // 15ms
+static const uint16_t BLE_CONN_LATENCY = 0;
+static const uint16_t BLE_CONN_TIMEOUT = 200;  // 2s, in 10ms units
+
+// Gamepad: 16 buttons plus X/Y axes. The axes are not used and are not
+// decoration — a gamepad collection with buttons and no axes is accepted
+// by some hosts and quietly ignored by others, and two spare bytes is a
+// cheap way out of finding out which one is on the desk.
+//
+// Report: [buttons 0-7][buttons 8-15][X][Y], 4 bytes.
+static const uint8_t bleReportMapGamepad[] = {
+  0x05, 0x01,        // Usage Page (Generic Desktop)
+  0x09, 0x05,        // Usage (Game Pad)
+  0xA1, 0x01,        // Collection (Application)
+  0x85, BLE_REPORT_ID,  //   Report ID
+  0x05, 0x09,        //   Usage Page (Button)
+  0x19, 0x01,        //   Usage Minimum (Button 1)
+  0x29, 0x10,        //   Usage Maximum (Button 16)
+  0x15, 0x00,        //   Logical Minimum (0)
+  0x25, 0x01,        //   Logical Maximum (1)
+  0x75, 0x01,        //   Report Size (1)
+  0x95, 0x10,        //   Report Count (16)
+  0x81, 0x02,        //   Input (Data,Var,Abs)
+  0x05, 0x01,        //   Usage Page (Generic Desktop)
+  0x09, 0x30,        //   Usage (X)
+  0x09, 0x31,        //   Usage (Y)
+  0x15, 0x81,        //   Logical Minimum (-127)
+  0x25, 0x7F,        //   Logical Maximum (127)
+  0x75, 0x08,        //   Report Size (8)
+  0x95, 0x02,        //   Report Count (2)
+  0x81, 0x02,        //   Input (Data,Var,Abs)
+  0xC0,              // End Collection
+};
+
+// Keyboard: the standard 8-byte report, plus the LED output report. The
+// output report is included, and getOutputReport() below creates the
+// characteristic to match, because a keyboard that advertises no way to
+// be told about caps lock is unusual enough that some hosts treat it as
+// a malformed one.
+//
+// Report: [modifiers][reserved][key 1..6], 8 bytes.
+static const uint8_t bleReportMapKeyboard[] = {
+  0x05, 0x01,        // Usage Page (Generic Desktop)
+  0x09, 0x06,        // Usage (Keyboard)
+  0xA1, 0x01,        // Collection (Application)
+  0x85, BLE_REPORT_ID,  //   Report ID
+  0x05, 0x07,        //   Usage Page (Keyboard/Keypad)
+  0x19, 0xE0,        //   Usage Minimum (Left Control)
+  0x29, 0xE7,        //   Usage Maximum (Right GUI)
+  0x15, 0x00, 0x25, 0x01,
+  0x75, 0x01, 0x95, 0x08,
+  0x81, 0x02,        //   Input (Data,Var,Abs)  -- modifier byte
+  0x95, 0x01, 0x75, 0x08,
+  0x81, 0x03,        //   Input (Cnst,Var,Abs)  -- reserved byte
+  0x95, 0x05, 0x75, 0x01,
+  0x05, 0x08,        //   Usage Page (LEDs)
+  0x19, 0x01, 0x29, 0x05,
+  0x91, 0x02,        //   Output (Data,Var,Abs) -- 5 LED bits
+  0x95, 0x01, 0x75, 0x03,
+  0x91, 0x03,        //   Output (Cnst,Var,Abs) -- LED padding
+  0x95, 0x06, 0x75, 0x08,
+  0x15, 0x00, 0x25, 0x65,
+  0x05, 0x07,        //   Usage Page (Keyboard/Keypad)
+  0x19, 0x00, 0x29, 0x65,
+  0x81, 0x00,        //   Input (Data,Ary,Abs)  -- 6 keycodes
+  0xC0,              // End Collection
+};
+
+// Mouse: 3 buttons, X/Y and a wheel — the shape every host has a driver
+// for without thinking about it.
+//
+// Report: [buttons][X][Y][wheel], 4 bytes.
+static const uint8_t bleReportMapMouse[] = {
+  0x05, 0x01,        // Usage Page (Generic Desktop)
+  0x09, 0x02,        // Usage (Mouse)
+  0xA1, 0x01,        // Collection (Application)
+  0x85, BLE_REPORT_ID,  //   Report ID
+  0x09, 0x01,        //   Usage (Pointer)
+  0xA1, 0x00,        //   Collection (Physical)
+  0x05, 0x09,        //     Usage Page (Button)
+  0x19, 0x01, 0x29, 0x03,
+  0x15, 0x00, 0x25, 0x01,
+  0x95, 0x03, 0x75, 0x01,
+  0x81, 0x02,        //     Input (Data,Var,Abs)  -- 3 button bits
+  0x95, 0x01, 0x75, 0x05,
+  0x81, 0x03,        //     Input (Cnst,Var,Abs)  -- padding
+  0x05, 0x01,        //     Usage Page (Generic Desktop)
+  0x09, 0x30, 0x09, 0x31, 0x09, 0x38,  // X, Y, Wheel
+  0x15, 0x81, 0x25, 0x7F,
+  0x75, 0x08, 0x95, 0x03,
+  0x81, 0x06,        //     Input (Data,Var,Rel)
+  0xC0,              //   End Collection
+  0xC0,              // End Collection
+};
+
+// HID usage bytes for the one action each BLE mode sends. The gamepad's
+// is worth a word: bit 3 is the same button index the USB gamepad's
+// BUTTON_X resolves to (USBHIDGamepad.h names buttons after Linux input
+// event codes, where BUTTON_X is 3 and not the SDL/XInput 2 — see the
+// CLAUDE.md gotcha). Matching it is the point: the two transports must
+// press the same thing or the host may not even route them to the same
+// place.
+static const uint8_t BLE_GAMEPAD_X_BIT = 0x08;  // button index 3
+static const uint8_t BLE_KEY_SPACE = 0x2C;      // HID keyboard usage for Space
+static const uint8_t BLE_MOUSE_LEFT = 0x01;     // button bit 0
+
+// Only ever non-null in a BLE mode, the same way `gamepad` and friends
+// are only ever non-null in their own USB mode.
+static NimBLEServer *bleServer = nullptr;
+static NimBLEHIDDevice *bleHid = nullptr;
+static NimBLECharacteristic *bleInput = nullptr;
+static uint8_t bleReport[BLE_REPORT_MAX];
+static uint8_t bleReportLen = 0;
+
+// Written from NimBLE's host task, read from loop() on core 1.
+//
+// bleReady, not "connected", is the flag the send path gates on, and the
+// distinction is the honest one: a host that has connected but not yet
+// subscribed to the input report will not receive a notification, so a
+// press in that window is no more delivered than one with no host at
+// all. Subscription is also the last step of the connect-pair-subscribe
+// sequence, so waiting for it costs nothing real.
+static volatile bool bleReady = false;
+static volatile uint16_t bleConnHandle = BLE_HS_CONN_HANDLE_NONE;
+// Set by appBlePairingMode(), cleared as soon as a host subscribes.
+// Purely a display distinction — the radio does exactly the same thing in
+// both states (advertise, connectable, discoverable) — so that the screen
+// can say "pairing" right after bonds were dropped rather than leaving
+// the user guessing whether the gesture did anything.
+static volatile bool blePairingArmed = false;
+
+// Push the link state down to the board. Called from the NimBLE host task
+// as well as from setup(), and boardShowLink() is a store and a poke on
+// both boards, so this stays inside what a callback may do.
+static void bleUpdateLink() {
+  if (!modeIsBle(activeMode)) {
+    boardShowLink(LINK_NONE);
+  } else if (bleReady) {
+    boardShowLink(LINK_CONNECTED);
+  } else {
+    boardShowLink(blePairingArmed ? LINK_PAIRING : LINK_ADVERTISING);
   }
 }
 
-static inline void sendRelease() {
+class BleCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer *server, NimBLEConnInfo &info) override {
+    bleConnHandle = info.getConnHandle();
+    // Ask for the interval we actually want as soon as there is a link to
+    // ask on. The host is free to say no; see BLE_CONN_ITVL_MIN above.
+    server->updateConnParams(info.getConnHandle(), BLE_CONN_ITVL_MIN,
+                             BLE_CONN_ITVL_MAX, BLE_CONN_LATENCY,
+                             BLE_CONN_TIMEOUT);
+    bleUpdateLink();
+  }
+
+  void onDisconnect(NimBLEServer *server, NimBLEConnInfo &info, int reason) override {
+    (void)info;
+    (void)reason;
+    bleReady = false;
+    bleConnHandle = BLE_HS_CONN_HANDLE_NONE;
+    // NimBLE re-advertises on disconnect by itself (advertiseOnDisconnect
+    // defaults to true), which is exactly the behaviour wanted: a tester
+    // that had to be power-cycled to be found again would be a nuisance
+    // on the board with no screen especially. Nothing to do but say so.
+    (void)server;
+    bleUpdateLink();
+  }
+
+  void onAuthenticationComplete(NimBLEConnInfo &info) override {
+    // Nothing to gate on here — subscription is what the send path waits
+    // for, and it comes after this. Kept for the link state only: a
+    // failed pairing leaves the link unusable and the screen should not
+    // go on claiming otherwise.
+    if (!info.isEncrypted()) bleReady = false;
+    bleUpdateLink();
+  }
+};
+
+class BleInputCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic *chr, NimBLEConnInfo &info, uint16_t subValue) override {
+    (void)chr;
+    // Bit 0 is "notifications enabled". Anything else (indications,
+    // unsubscribe) means reports are not going to arrive the way this
+    // firmware sends them.
+    bool on = (subValue & 0x0001) != 0;
+    bleReady = on;
+    if (on) {
+      bleConnHandle = info.getConnHandle();
+      // The pairing gesture has done its job the moment a host is
+      // actually listening.
+      blePairingArmed = false;
+    }
+    bleUpdateLink();
+  }
+};
+
+static BleCallbacks bleCallbacks;
+static BleInputCallbacks bleInputCallbacks;
+
+// Build the GATT database for this boot's BLE identity and start
+// advertising. Called once from setup(), only in a BLE mode — the same
+// only-construct-what-this-boot-is rule the USB device classes follow,
+// for the same reason: the report map is registered with the stack here
+// and there is no supported way to swap it afterwards.
+static void bleBegin(Mode mode) {
+  const uint8_t *map = nullptr;
+  size_t mapLen = 0;
+  uint16_t appearance = 0;
+  bool wantsOutputReport = false;
+
+  switch (mode) {
+    case MODE_BLE_GAMEPAD:
+      map = bleReportMapGamepad; mapLen = sizeof(bleReportMapGamepad);
+      appearance = HID_GAMEPAD; bleReportLen = 4;
+      break;
+    case MODE_BLE_KEYBOARD:
+      map = bleReportMapKeyboard; mapLen = sizeof(bleReportMapKeyboard);
+      appearance = HID_KEYBOARD; bleReportLen = 8;
+      wantsOutputReport = true;
+      break;
+    case MODE_BLE_MOUSE:
+      map = bleReportMapMouse; mapLen = sizeof(bleReportMapMouse);
+      appearance = HID_MOUSE; bleReportLen = 4;
+      break;
+    default:
+      return;  // not a BLE boot; the radio stays off entirely
+  }
+
+  // The GAP device name. Deliberately modeBleName() and not
+  // modeProductName(): NimBLE caps this at 31 bytes and silently refuses
+  // anything longer, which the USB product strings exceed. See mode.h.
+  NimBLEDevice::init(modeBleName(mode));
+
+  // Bonding, no MITM, secure connections: "just works" pairing, which is
+  // the only kind available on a device with one button and (on one
+  // board) no display to show a passkey on. Bonding is not optional —
+  // the input report characteristic is READ_ENC, and every host worth
+  // testing against refuses to use a HID device it has not paired with.
+  NimBLEDevice::setSecurityAuth(true, false, true);
+  NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+
+  bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(&bleCallbacks, false);
+
+  bleHid = new NimBLEHIDDevice(bleServer);
+  bleHid->setManufacturer("usb-latency");
+  // Vendor ID source 0x02 = USB Implementers Forum. The VID/PID are the
+  // Espressif defaults this device already enumerates with over USB, so a
+  // host that has seen both transports at least sees one vendor.
+  bleHid->setPnp(0x02, 0x303A, 0x1001, 0x0100);
+  // Country code 0 (not localised), flags 0x01 = remote wake. Remote wake
+  // is what lets a press bring a sleeping host back, which is a thing a
+  // real HID device does and one this one may well be pointed at.
+  bleHid->setHidInfo(0x00, 0x01);
+  bleHid->setReportMap(const_cast<uint8_t *>(map), mapLen);
+
+  bleInput = bleHid->getInputReport(BLE_REPORT_ID);
+  bleInput->setCallbacks(&bleInputCallbacks);
+  if (wantsOutputReport) bleHid->getOutputReport(BLE_REPORT_ID);
+  // Not a real measurement — there is no battery on either board, both
+  // run off the USB cable that is also the debug channel. It is here
+  // because hosts that find a Battery Service with no value read it
+  // anyway and some log an error every time, and 100% is the least
+  // misleading constant for a mains-powered device.
+  bleHid->setBatteryLevel(100);
+
+  bleServer->start();
+
+  NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+  // enableScanResponse() before setName(): NimBLEAdvertising::setName()
+  // puts the name in the scan response only if the scan response is
+  // already enabled, and otherwise spends the advertisement's own bytes
+  // on it. The advertisement holds flags, appearance, the HID service
+  // UUID and the preferred connection interval; the name would not fit
+  // alongside them.
+  adv->enableScanResponse(true);
+  adv->setName(modeBleName(mode));
+  adv->setAppearance(appearance);
+  adv->addServiceUUID(bleHid->getHidService()->getUUID());
+  adv->setPreferredParams(BLE_CONN_ITVL_MIN, BLE_CONN_ITVL_MAX);
+  adv->start();
+
+  bleUpdateLink();
+}
+
+// One notification, on the press path. Everything it needs is already
+// decided (which bytes, how many, which connection), so this is a memset,
+// two stores and the notify.
+//
+// Not blocking, and that matters: NimBLECharacteristic::notify() with an
+// explicit connection handle allocates an mbuf and hands it to
+// ble_gattc_notify_custom(), which queues the ATT PDU on that
+// connection's transmit queue and returns. It does not wait for the next
+// connection event and it does not wait for an acknowledgement — that is
+// what an *indication* would do, and why this is a notification. The
+// handle is passed explicitly rather than left to default for the same
+// reason: the no-handle form walks getPeerDevices(), which returns a
+// std::vector by value, i.e. a heap allocation per press.
+//
+// The one thing it can block on is NimBLE's host mutex, if the host task
+// happens to be mid-operation at that instant — microseconds, and on the
+// other core (the NimBLE tasks are pinned to core 0, loop() has core 1).
+// Untested on hardware; see CLAUDE.md.
+static bool bleSend(bool pressed) {
+  if (!bleInput || !bleReady) return false;
+
+  memset(bleReport, 0, bleReportLen);
+  if (pressed) {
+    switch (activeMode) {
+      case MODE_BLE_GAMEPAD:  bleReport[0] = BLE_GAMEPAD_X_BIT; break;
+      case MODE_BLE_KEYBOARD: bleReport[2] = BLE_KEY_SPACE; break;
+      case MODE_BLE_MOUSE:    bleReport[0] = BLE_MOUSE_LEFT; break;
+      default: return false;
+    }
+  }
+  // A release is the all-zero report the memset already produced.
+  return bleInput->notify(bleReport, bleReportLen, bleConnHandle);
+}
+
+// Pairing mode, and what it concretely does: forget every bonded host,
+// drop the current link if there is one, and advertise again.
+//
+// It is deliberately not "become discoverable for 30 seconds", because
+// discoverability is not the scarce thing here — a BLE mode advertises
+// from boot and re-advertises the moment a host goes away, so there is
+// never a window a new host can't see the device. What actually stops a
+// new host connecting is a *stale bond*: the device keeps a key for a
+// machine that has since forgotten it (or has three of them, NimBLE's
+// CONFIG_BT_NIMBLE_MAX_BONDS), and the pairing attempt fails in a way
+// that looks from the outside like the device being broken. Dropping the
+// bonds is the gesture that fixes that, and it is the same gesture a
+// keyboard's "unpair" button performs.
+//
+// The host has its own half of that bond and this cannot reach it, so
+// moving a device between machines usually also needs the old machine to
+// forget it. Nothing here can help with that; see CLAUDE.md.
+//
+// Called from the board's menu, i.e. from the UI task on core 0.
+// deleteAllBonds() writes NVS and therefore erases flash, which stalls
+// the cache on both cores — fine exactly here, and for the same reason
+// boardWriteRun() is: it is a deliberate menu action taken while nothing
+// is being measured.
+void appBlePairingMode() {
+  if (!modeIsBle(activeMode)) return;
+
+  blePairingArmed = true;
+  bleReady = false;
+
+  if (bleServer && bleConnHandle != BLE_HS_CONN_HANDLE_NONE) {
+    bleServer->disconnect(bleConnHandle);
+  }
+  NimBLEDevice::deleteAllBonds();
+  // Harmless if the disconnect above already restarted it; NimBLE
+  // ignores a start on an already-advertising instance.
+  NimBLEDevice::startAdvertising();
+
+  bleUpdateLink();
+}
+
+// Returns whether anything actually left the device. False in a BLE mode
+// with no host listening — see boardShowPress()'s `sent` in board.h for
+// what the caller does with that, and note that MODE_STORAGE's `default:`
+// arm returns false for free, which is the same "this identity sends
+// nothing" it always meant.
+static inline bool sendPress() {
   switch (activeMode) {
-    case MODE_GAMEPAD:  gamepad->releaseButton(BUTTON_X); break;
-    case MODE_KEYBOARD: keyboard->release(' '); break;
-    case MODE_MOUSE:    mouse->release(MOUSE_LEFT); break;
-    default: break;
+    case MODE_GAMEPAD:  gamepad->pressButton(BUTTON_X); return true;
+    case MODE_KEYBOARD: keyboard->press(' '); return true;
+    case MODE_MOUSE:    mouse->press(MOUSE_LEFT); return true;
+    case MODE_BLE_GAMEPAD:
+    case MODE_BLE_KEYBOARD:
+    case MODE_BLE_MOUSE: return bleSend(true);
+    default: return false;
+  }
+}
+
+static inline bool sendRelease() {
+  switch (activeMode) {
+    case MODE_GAMEPAD:  gamepad->releaseButton(BUTTON_X); return true;
+    case MODE_KEYBOARD: keyboard->release(' '); return true;
+    case MODE_MOUSE:    mouse->release(MOUSE_LEFT); return true;
+    case MODE_BLE_GAMEPAD:
+    case MODE_BLE_KEYBOARD:
+    case MODE_BLE_MOUSE: return bleSend(false);
+    default: return false;
   }
 }
 
@@ -487,6 +935,12 @@ static void serviceAutoTest(uint32_t now) {
     // one that gets debounced against their release.
     if (stableState) return;
     autoStartRequested = false;
+    // A run in a BLE mode with nothing listening would spend three to
+    // five minutes sending nothing and recording nothing, and would
+    // write out an empty file at the end of it. Refusing is the kinder
+    // failure: the screen already says the link is down, and the menu
+    // item can simply be selected again once it isn't.
+    if (modeIsBle(activeMode) && !bleReady) return;
     autoDone = 0;
     autoPhase = AUTO_GAP;
     runCount = 0;
@@ -514,8 +968,18 @@ static void serviceAutoTest(uint32_t now) {
         // measure the same thing a real button press does, or the two
         // can't be compared against each other.
         int64_t edgeMicros = esp_timer_get_time();
-        sendPress();
-        boardShowPress(true, activeMode, edgeMicros);
+        bool sent = sendPress();
+        if (!sent) {
+          // Only reachable in a BLE mode whose host went away mid-run.
+          // Stop, rather than grind through the remaining iterations
+          // pressing a button nothing is listening to — and stop before
+          // telling the board about a press, so it neither starts a
+          // measurement nor shows a press that will never be released.
+          // What was collected up to here is still written out.
+          stopAutoTest();
+          return;
+        }
+        boardShowPress(true, activeMode, edgeMicros, true);
       }
       // runGapMs is already the gap that just elapsed (rolled when this
       // phase was entered); it stays put until the next one is rolled, so
@@ -532,8 +996,10 @@ static void serviceAutoTest(uint32_t now) {
       if ((now - autoPressedAtMs) < AUTO_HOLD_MS) return;
       if (boardMeasurementBusy() && (now - autoPressedAtMs) < AUTO_HOLD_MAX_MS) return;
 
-      sendRelease();
-      boardShowPress(false, activeMode, esp_timer_get_time());
+      {
+        bool sent = sendRelease();
+        boardShowPress(false, activeMode, esp_timer_get_time(), sent);
+      }
       autoDone++;
 
       // Getting here means the measurement is done (or the hold ceiling
@@ -563,9 +1029,20 @@ void setup() {
   prefs.begin(PREFS_NAMESPACE, false);
   // `stored < MODE_COUNT` is the validation, and it keeps working
   // unchanged now that MODE_STORAGE exists — precisely because this key
-  // only ever holds one of the three HID identities. Storage lives in its
+  // only ever holds one of the six HID identities. Storage lives in its
   // own key, so a stored value of MODE_STORAGE here would still be
   // rejected as the corruption it would be.
+  //
+  // MODE_COUNT growing from 3 to 6 is the whole of what the BLE modes
+  // needed here, and it is safe in the direction that matters: values
+  // 0..2 still mean what they always meant, so a device that was in
+  // MOUSE stays in MOUSE across the upgrade. The other direction is
+  // worth knowing rather than guarding — a device left in a BLE mode and
+  // then flashed with a firmware that predates them stores a 3, 4 or 5
+  // that the OLD code's `stored < 3` rejects, and it comes up as a
+  // gamepad. That is the right failure: the old firmware cannot be a BLE
+  // anything, so falling back beats honouring a value it would
+  // misinterpret.
   uint8_t stored = prefs.getUChar(PREFS_KEY, MODE_GAMEPAD);
   activeMode = (stored < MODE_COUNT) ? static_cast<Mode>(stored) : MODE_GAMEPAD;
   pendingMode = activeMode;
@@ -612,8 +1089,18 @@ void setup() {
     // HID device is constructed, so nothing contributes a report
     // descriptor and the device enumerates as a plain mass-storage
     // gadget. Same `default:` arm that makes sendPress() send nothing.
+    //
+    // The three BLE modes land here too, and for them it is just as
+    // deliberate: constructing a USBHIDKeyboard in MODE_BLE_KEYBOARD
+    // would put a HID collection in the USB descriptor and hand the host
+    // a second, wired keyboard that shadows the one being measured. A
+    // BLE boot is a CDC serial port over USB and nothing else.
     default: break;
   }
+  // Set even in a BLE mode: USBSerial is still there, and a debug port
+  // that names the mode it belongs to beats an anonymous one. In a BLE
+  // mode this is not the name the Bluetooth side shows — see
+  // modeBleName() in mode.h.
   USB.productName(modeProductName(activeMode));
   USBSerial.begin();
   USB.begin();
@@ -621,6 +1108,14 @@ void setup() {
   // Only now that USB is up is it safe to spend time on the indicator.
   boardShowBoot(activeMode, pendingMode);
   boardShowHoldHint(RUNG_STATS);
+
+  // The radio last, after the screen exists, so the several hundred
+  // milliseconds the controller takes to come up are spent with
+  // something already on the panel rather than in front of a black one.
+  // A no-op in the four non-BLE modes, which is what keeps the BLE
+  // stack's RAM cost off every other boot despite it being linked in
+  // unconditionally.
+  bleBegin(activeMode);
 }
 
 void loop() {
@@ -656,8 +1151,12 @@ void loop() {
         menuActionTaken = false;
       } else {
         // HID report first, feedback second — never the other way round.
-        sendPress();
-        boardShowPress(true, activeMode, edgeMicros);
+        // In a BLE mode with no host listening nothing is sent, and the
+        // board is told so: a measurement started against a report that
+        // never left would time out by construction and land a bogus
+        // 500ms in the statistics.
+        bool sent = sendPress();
+        boardShowPress(true, activeMode, edgeMicros, sent);
         cycledThisHold = false;
         if (boardHasSensor()) {
           statsRungAhead = true;
@@ -678,8 +1177,8 @@ void loop() {
         // see boardMenuSelect() below.
         if (!menuActionTaken) boardMenuTap();
       } else {
-        sendRelease();
-        boardShowPress(false, activeMode, edgeMicros);
+        bool sent = sendRelease();
+        boardShowPress(false, activeMode, edgeMicros, sent);
         statsRungAhead = menuRungAhead = false;
         boardShowHoldHint(RUNG_STATS);
       }

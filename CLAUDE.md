@@ -1,10 +1,16 @@
 # usb-latency
 
-PlatformIO firmware for measuring/minimizing input-to-USB latency: a board
-with one button emulates a USB HID gamepad, keyboard, or mouse, and a press
-is turned into a HID report as directly as possible. On the AtomS3R it can
-also boot as a USB drive instead, handing the host the flash partition the
-recorded runs live on.
+PlatformIO firmware for measuring/minimizing input-to-photon latency: a
+board with one button emulates a HID gamepad, keyboard, or mouse — over
+USB **or** Bluetooth LE — and a press is turned into a HID report as
+directly as possible. On the AtomS3R it can also boot as a USB drive
+instead, handing the host the flash partition the recorded runs live on.
+
+The six HID identities are three actions times two transports, and the
+second transport is the whole point of having it: the same button, the
+same sensor, the same statistics and the same run files, so a BLE number
+and a USB number differ only in how the report reached the host. See the
+`Mode` table below.
 
 Two boards are supported, one PlatformIO env each, from one shared source
 tree:
@@ -18,7 +24,68 @@ The AtomS3R variant also reads an M5Stack Unit Light (U012) on the Grove
 port. That sensor does the actual latency measurement: a press starts a
 clock at the button edge and stops it when the light crosses
 `LIGHT_THRESHOLD` (default 3000 ADC counts), so the figure on screen
-covers button-down → USB → host → compositor → panel.
+covers button-down → USB or BLE → host → compositor → panel.
+
+## Modes
+
+A `Mode` is a host-facing identity, fixed for the life of a boot, chosen
+before USB or the radio is brought up, and changed only by a manual
+reboot (see the two mode-switching gotchas below). There are six in the
+rotation plus one outside it:
+
+| Mode | transport | a press sends | LED / screen colour |
+| --- | --- | --- | --- |
+| `MODE_GAMEPAD` | USB HID | gamepad "X" button | red |
+| `MODE_KEYBOARD` | USB HID | Space | green |
+| `MODE_MOUSE` | USB HID | left click | blue |
+| `MODE_BLE_GAMEPAD` | BLE HoGP | gamepad "X" button | yellow |
+| `MODE_BLE_KEYBOARD` | BLE HoGP | Space | cyan |
+| `MODE_BLE_MOUSE` | BLE HoGP | left click | magenta |
+| `MODE_STORAGE` | USB MSC | nothing (see USB drive mode) | — |
+
+The colour column is one table for both boards: it is what the S3-Zero's
+single WS2812 shows while the button is held, and what the AtomS3R draws
+the mode name in. USB gets the primaries, BLE the secondaries; the
+pairing is arbitrary (no colour means "the same, but wireless") but six
+distinguishable colours on a board whose whole output is one pixel is
+worth more than a mnemonic.
+
+In a **BLE mode** the device does not enumerate as a USB HID device at
+all — USB is a CDC serial port for debug output and nothing else — and
+the press becomes a HID-over-GATT notification to a bonded host. The
+Bluetooth name is e.g. `Latency Tester BLE Keyboard` (`modeBleName()`),
+used for both the advertisement and the GAP device name, so a host shows
+the same string in its picker and after connecting. The USB product
+string for the same boot is the longer `USB Latency Tester - BLE
+Keyboard` — see the BLE-name-length gotcha below for why those cannot be
+one string.
+
+A press in a BLE mode with **no host connected sends nothing and starts
+no measurement** — timing a report that never left would only bank a
+guaranteed `MEASURE_TIMEOUT_MS` in the statistics. The AtomS3R says so in
+two places: the mode line carries a right-aligned `LINK` / `ADV` / `PAIR`
+tag at all times, and the headline shows `not connected` for that press.
+The S3-Zero lights the mode colour *dim* instead of full.
+
+**Pairing** concretely means: forget every bonded host, drop the current
+link, and advertise again. It is not "become discoverable for 30
+seconds" — a BLE mode advertises from boot and re-advertises the moment a
+host goes away, so discoverability is never the scarce thing. A *stale
+bond* is: the device holds a key for a machine that has forgotten it (or
+holds three, NimBLE's `CONFIG_BT_NIMBLE_MAX_BONDS`), and the pairing
+attempt then fails in a way that looks like broken hardware. On the
+AtomS3R it is a menu item, present only in a BLE mode. **The S3-Zero has
+no pairing gesture and no link display, deliberately** — its BLE story is
+"advertises from boot, re-advertises when a host goes away, pairs with
+anything unbonded", and a stale bond there is fixed by forgetting the
+device on the *host*, or failing that by erasing flash. Inventing a
+second hold gesture on a button that already carries press-to-send and
+hold-to-cycle-mode, on a board with no way to show that the gesture
+registered, would be worse than not having one. Note the device can only
+ever drop its own half of a bond; moving between machines usually also
+needs the old machine to forget the device.
+
+## Interaction
 
 The one button drives two entirely different things depending on whether
 a menu (AtomS3R only) is open:
@@ -28,7 +95,7 @@ a menu (AtomS3R only) is open:
 | normal | press | send the mode's HID report, and time the response | — |
 | normal | hold 1s | reset the measurement statistics | yes |
 | normal | hold 2s | open the menu (below) | yes |
-| normal | hold 3s, repeating | advance the *pending* mode (reboot to apply) | no (S3-Zero only) |
+| normal | hold 3s, repeating | advance the *pending* mode, 1 of 6 (reboot to apply) | no (S3-Zero only) |
 | menu | tap | advance — move the selection, or a picker's candidate | yes |
 | menu | hold 1s | trigger the highlighted item | yes |
 | auto test running | press | stop the run (and nothing else) | yes |
@@ -36,21 +103,26 @@ a menu (AtomS3R only) is open:
 
 The S3-Zero has no screen and so no menu — its button is exactly what it
 always was: press sends the action, holding cycles the pending mode every
-3s. On the AtomS3R, a 2s hold from normal operation opens a small menu
-(`Light meter`, `Auto test`, `USB drive`, `Change mode`, `Exit`) that owns
+3s through all six. On the AtomS3R, a 2s hold from normal operation opens
+a small menu (`Light meter`, `Auto test`, `USB drive`, `Change mode`,
+`Pairing` — BLE modes only — `Exit`) that owns
 every subsequent press until it exits: tap cycles the highlighted item, a
 1s+ hold triggers it. `Change mode` drops into a picker where tap advances
 the candidate mode (persisting it immediately, same NVS write the
 S3-Zero's hold-to-cycle gesture always did) and hold confirms by just
 leaving. `USB drive` drops into an identical-looking picker where tap
 toggles `ARMED`/`OFF` and hold leaves — see USB drive mode below.
-`Light meter` toggles instantly and exits; `Exit` just exits. No press
+`Light meter` toggles instantly and exits; `Pairing` (BLE modes only)
+drops every bond and re-advertises, then exits; `Exit` just exits. No press
 reaches the HID/measurement path while the menu is open — see
 `wasMenuActiveAtPress` in `main.cpp` for how that's decided once per press
 rather than re-checked live.
 
-`Auto test` runs `AUTO_TEST_ITERATIONS` (500) presses in the current mode
-unattended, spaced by a random 200-500ms gap — roughly three to five
+`Auto test` refuses to start in a BLE mode with no host connected (three
+to five minutes of sending nothing, ending in an empty file, is not a
+kinder failure than saying no) and stops itself if the link drops
+mid-run, writing out what it had. Otherwise it runs
+`AUTO_TEST_ITERATIONS` (500) presses in the current mode unattended, spaced by a random 200-500ms gap — roughly three to five
 minutes, abortable at any point with a press — each going through exactly
 the same send-and-measure path a real button press does. It lives in
 `main.cpp` (`serviceAutoTest()`), not the board layer, because only
@@ -96,15 +168,19 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
 ## Project layout
 
 - `platformio.ini` — a shared `[env]` section holds everything common:
-  native USB-OTG mode (`ARDUINO_USB_MODE=0`) and `ARDUINO_USB_CDC_ON_BOOT=0`
+  native USB-OTG mode (`ARDUINO_USB_MODE=0`), `ARDUINO_USB_CDC_ON_BOOT=0`
   (deliberately not `1` — see the CDC-on-boot gotcha below; a manual
   `USBCDC` in `src/main.cpp` (`USBSerial`) is begun explicitly instead, so
-  Serial-style debug output over USB is still available). The two envs then
+  Serial-style debug output over USB is still available), and a `lib_deps`
+  on `h2zero/NimBLE-Arduino@^2.3`, which both envs get because every mode
+  has to be reachable on either board. The two envs then
   differ only in `board`, `build_src_filter` (which `board_*.cpp` gets
-  compiled), `board_build.partitions`, and — for the AtomS3R — a
-  `lib_deps` on M5GFX. Both envs restate their board profile's
+  compiled), `board_build.partitions`, and — for the AtomS3R — an extra
+  `lib_deps` entry for M5GFX. Both envs restate their board profile's
   `extra_flags` minus `ARDUINO_USB_MODE=1`, which would otherwise
-  redefine the `=0` set above.
+  redefine the `=0` set above. **Do not add dependencies with `pio pkg
+  install`** — see the gotcha below; it rewrites this file and strips
+  every comment in it.
 - `partitions_atoms3r_8MB.csv` — the AtomS3R's partition table, replacing
   the AtomS3 board profile's stock `default_8MB.csv` (which has a SPIFFS
   partition this project can't use). `nvs` stays at `0x9000`/`0x5000`,
@@ -112,21 +188,40 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   device doesn't lose its persisted mode; then a single 4MB `factory` app
   at `0x10000` (no OTA — generous on purpose, a later task adds a BLE
   stack), `ffat` filling `0x410000`-`0x7F0000`, and `coredump` in the last
-  64KB where the stock tables keep it. The S3-Zero env has 4MB, no sensor
+  64KB where the stock tables keep it — and the "a later task adds a BLE
+  stack" it was sized generously for is the task that has now landed, at
+  a cost of ~290KB. The S3-Zero env has 4MB, no sensor
   and therefore no automated test, so it keeps stock `default.csv` and
-  stores nothing.
+  stores nothing. That last point was re-checked rather than assumed when
+  BLE landed: the expectation was that a NimBLE host plus controller
+  would overflow `default.csv`'s ~1.25MB OTA slot and force a
+  single-factory-app table there too. It does not — 684KB, 52% of the
+  slot — so the S3-Zero still has no table of its own. If that ever
+  changes, `nvs` has to stay at `0x9000`/`0x5000`, or every device loses
+  both its persisted mode and its BLE bonds.
 - `src/main.cpp` — board-independent core: the mode state machine, NVS
-  persistence, the single HID device, and the debounce loop. The button
-  drives exactly one of three USB HID device modes at a time: gamepad "X"
+  persistence, the single HID device (USB or BLE), the BLE stack, and the
+  debounce loop. It is the only file that touches USB or the radio. The
+  button drives exactly one of six HID modes at a time: gamepad "X"
   button (`USBHIDGamepad`), keyboard space key (`USBHIDKeyboard`), or mouse
-  left click (`USBHIDMouse`). Only the active mode's device class is ever
+  left click (`USBHIDMouse`) over USB, and the same three actions over BLE
+  as HID-over-GATT notifications. Only the active mode's device class is ever
   constructed (`new`'d at runtime in `setup()`, not declared as a global),
   so the USB descriptor for a given boot contains a single HID collection —
   the device enumerates as a genuine single-purpose gamepad, keyboard, or
-  mouse, not a multi-collection composite. The USB product name is set per
+  mouse, not a multi-collection composite. A BLE mode constructs none of
+  them, so USB is CDC-only that boot, and builds a `NimBLEHIDDevice`
+  instead — one HID service, one report map, one input report — which is
+  the same rule one layer out. The USB product name is set per
   mode too (`modeProductName()`, e.g. "USB Latency Tester - Keyboard"), so
-  the host's device picker identifies the active mode by name. Holding the
-  button advances a *pending* mode (gamepad → keyboard → mouse → gamepad)
+  the host's device picker identifies the active mode by name; in a BLE
+  mode a shorter `modeBleName()` is used for everything Bluetooth shows.
+  `sendPress()`/`sendRelease()`
+  now return whether anything actually left the device, which is false in
+  a BLE mode with no host subscribed and is what stops a measurement being
+  started against a report that never went out. Holding the
+  button advances a *pending* mode (gamepad → keyboard → mouse → BLE
+  gamepad → BLE keyboard → BLE mouse → gamepad)
   by one step every `MODE_HOLD_MS` (3s) for as long as it's held,
   persisting each step to NVS via `Preferences` — this only selects what a
   future reboot will pick up; it does not change what's active this
@@ -147,21 +242,33 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `mode`, because the HID identity has to go on being remembered while a
   drive is armed — that's what the drive screen offers as the way back.
 - `src/mode.h` — the `Mode` enum plus the strings naming it (mode name,
-  the action a press sends, the USB product string). Header-only lookup
-  tables, shared by the core and the board layer. A `Mode` is a USB
-  identity and nothing more, which is exactly why it is stuck until a
-  reboot — see the light-meter-is-not-a-mode gotcha below.
-  `MODE_STORAGE` deliberately sits *past* `MODE_COUNT`, so the
-  `% MODE_COUNT` rotation can never reach it — see the
+  the action a press sends, the USB/GAP product string, the shorter BLE
+  advertising name) and `modeIsBle()`, the one place the two transports
+  are told apart. Header-only lookup
+  tables, shared by the core and the board layer. A `Mode` is a
+  host-facing identity and nothing more, which is exactly why it is stuck
+  until a reboot — see the light-meter-is-not-a-mode gotcha below.
+  **The enum's order is a stored format**: 0..2 still mean what they
+  always meant, so the BLE three are appended after `MODE_MOUSE` rather
+  than interleaved with their USB counterparts, which would have read
+  better and silently changed what every deployed device was.
+  `MODE_COUNT` grew from 3 to 6 — which is the entire change the rotation
+  needed — and `MODE_STORAGE` deliberately still sits *past* it, so the
+  `% MODE_COUNT` rotation can never reach it. See the
   storage-is-a-mode-but-not-in-the-rotation gotcha below.
 - `src/board.h` — the board I/O contract: `boardBegin()`,
   `boardHasSensor()`, `boardButtonPressed()`, `boardShowBoot()`,
-  `boardShowPress()`, `boardShowPending()`, `boardResetStats()`,
+  `boardShowPress()` (which takes a `sent` flag, false when a BLE press
+  had no host to go to), `boardShowLink()` (connected / advertising /
+  pairing, pushed down from `main.cpp`, often from a NimBLE callback —
+  so implementations must be a store and a poke, like every other
+  cross-core entry point here), `boardShowPending()`, `boardResetStats()`,
   `boardShowHoldHint()`, plus the menu contract —
   `boardMenuActive()`, `boardEnterMenu()`, `boardMenuTap()`,
-  `boardMenuSelect()`, and `appAdvancePendingMode()` (the one function
-  that runs the other way: implemented in `main.cpp`, called by the
-  board's mode-picker submenu). Run recording adds `RunSample`/`RunRecord`
+  `boardMenuSelect()`, and the two that run the other way —
+  `appAdvancePendingMode()` (implemented in `main.cpp`, called by the
+  board's mode-picker submenu) and `appBlePairingMode()` (likewise,
+  called by the menu's BLE-only `Pairing` item). Run recording adds `RunSample`/`RunRecord`
   plus one function each way: `appRecordSample()` (board → `main.cpp`,
   one measurement's latency/direction/timeout as soon as it resolves) and
   `boardWriteRun()` (`main.cpp` → board, the whole buffered run, once,
@@ -178,20 +285,28 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   per press edge via `boardMenuActive()`, whether that press is HID input
   or menu input. Exactly one implementation is compiled per env, so there
   are no board `#ifdef`s in `main.cpp` and nothing in the board layer
-  touches USB. Mode state is passed in rather than duplicated there.
+  touches USB or the radio. Mode state is passed in rather than
+  duplicated there.
 - `src/board_s3zero.cpp` — ESP32-S3-Zero: BOOT button (GPIO0, active-low),
   onboard WS2812 (GPIO21). No sensor, no menu, no filesystem and no data
   partition at all, so the measurement, menu, run-storage and USB-drive
   halves of the contract are all no-ops here — `boardHasStorage()`
   returning false is what stops `main.cpp` even *reading* the armed flag
-  on this board, so it can never boot into a drive it has no blocks for. The LED lights up while the button is held, in a
-  colour identifying the active mode (red/green/blue). Once a hold crosses
+  on this board, so it can never boot into a drive it has no blocks for.
+  BLE has no display and no pairing gesture here either — see the Modes
+  section above for why that is a refusal rather than an omission. The LED
+  lights up while the button is held, in a
+  colour identifying the active mode (the six-colour table in Modes,
+  above). A press in a BLE mode with no host connected lights it *dim*
+  instead of full, which is the board's whole "that went nowhere" story.
+  Once a hold crosses
   `MODE_HOLD_MS`, it flashes white for `MODE_SWITCH_FLASH_MS` (500ms) to
   mark the first mode change in that hold, then shows the new pending
   mode's colour; further changes within the same hold skip the flash and
-  jump straight to the next colour. On boot, the LED also briefly flashes
-  the active mode's colour (`BOOT_FLASH_MS`, 200ms) so the mode is visible
-  without pressing the button first.
+  jump straight to the next colour — six colours now, so one continuous
+  hold takes 18s to get back where it started. On boot, the LED also
+  briefly flashes the active mode's colour (`BOOT_FLASH_MS`, 200ms) so the
+  mode is visible without pressing the button first.
 - `src/board_atoms3r.cpp` — AtomS3R: screen button (GPIO41, active-low —
   the whole LCD face is the button), 0.85" 128x128 LCD via M5GFX, and the
   Unit Light's analog output on GPIO1 (ADC1_CH0). There is no separate
@@ -200,11 +315,16 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   are the feedback. Normal-operation screen, top to bottom: the last
   measurement (or the live meter reading, in the meter view — see the
   light-meter-is-not-a-mode gotcha), the R/F count-and-mean line, the
-  active mode's name, a hint for what continuing to hold would do next
+  active mode's name — with, in a BLE mode only, a right-aligned
+  `LINK`/`ADV`/`PAIR` tag beside it in green/dim/amber — a hint for what
+  continuing to hold would do next
   (or the pending mode once a hold has queued a change), and a stacked
   R/F histogram of the last `HIST_CAPACITY` (default 500, overridable)
   samples of each direction sharing one time axis, with the axis's min
-  and max labelled at its ends. A 2s hold replaces all of that with a
+  and max labelled at its ends. The headline doubles as the press-time
+  BLE feedback: a press with no host connected shows `not connected`
+  there and starts no measurement at all, so the statistics are untouched
+  by it. A 2s hold replaces all of that with a
   small menu instead — see the menu bullet in the interaction table above
   and the file header in `board_atoms3r.cpp` for the screens it uses. It
   also owns the wear-levelling side of USB drive mode
@@ -443,9 +563,9 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   out of it needed a reboot, for a feature that touches no USB state at
   all. It also meant a press sent nothing while the meter was up, so you
   couldn't make the display do the thing you were trying to aim at. The
-  split that actually holds: a `Mode` is a USB identity (boot-fixed,
-  reboot to change, three of them), and the meter is a *view* the board
-  layer flips at runtime — from the menu now (its "Light meter" item), no
+  split that actually holds: a `Mode` is a host-facing identity
+  (boot-fixed, reboot to change, six of them now), and the meter is a
+  *view* the board layer flips at runtime — from the menu now (its "Light meter" item), no
   USB involvement, HID reports and measurements carrying on underneath it
   whenever the menu isn't the one holding the button. If something new
   needs switching, the first question is still which of those two it is.
@@ -534,14 +654,17 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   reached and that env's descriptor is byte-for-byte what it was before
   any of this existed, despite `USBMSC.h` being included unconditionally.
 - **Storage is a `Mode`, but it must not be in the mode rotation — hence
-  the gap after `MODE_COUNT`.** It genuinely is a fourth USB identity:
+  the gap after `MODE_COUNT`.** It genuinely is an identity of its own
+  (the fourth when this was written, the seventh now):
   fixed at boot, decided before `USB.begin()`, with its own product
   string. So it's a `Mode`, and that is what makes it free in the press
   path — `sendPress()`/`sendRelease()` already end in `default: break;`,
   which is precisely "this identity sends nothing", so no new branch goes
   into the hot path and no null HID pointer can be dereferenced. But
-  `MODE_COUNT` stays at 3 and `MODE_STORAGE` sits *past* it, so
-  `(pendingMode + 1) % MODE_COUNT` structurally cannot produce it: you
+  `MODE_COUNT` — 3 when this was written, 6 since the BLE modes landed —
+  bounds the rotation and `MODE_STORAGE` sits *past* it, so
+  `(pendingMode + 1) % MODE_COUNT` structurally cannot produce it however
+  the count grows: you
   cannot hold the button into a drive, and the S3-Zero cannot reach one
   at all. Note `MODE_COUNT` doubles as `board_atoms3r.cpp`'s "nothing
   drawn yet" sentinel, which is the other reason `MODE_STORAGE` could not
@@ -613,19 +736,142 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   rather than one-shot on the same reasoning that made it a `Mode` — a
   drive that turned back into a gamepad on every replug is useless for
   carrying files between machines.
-- **The AtomS3R top menu is five items now, and the row pitch had to
-  shrink for them to fit.** At the original 16px pitch from y=28 the
-  fifth row would land on the "tap: next" hint at y=96; it's 14px from
-  y=22 instead. The 128x128 panel has room for one more item after that
-  and no more — anything further needs a scrolling menu, not another row.
+- **The AtomS3R top menu is six items in a BLE mode, and the row pitch
+  has shrunk twice for them.** 16px from y=28 fitted four; 14px from y=22
+  fitted five; six (the BLE list, with `Pairing`) would have put the last
+  row at y=92, overlapping the "tap: next" hint at y=96, so it is 12px
+  from y=20 now — last row at y=80, eight clear pixels below it, and
+  Font0 being 8px tall means a 12px pitch still shows a gap between rows.
+  **That is the panel full.** A seventh item needs a scrolling menu, not
+  another row. Note the items are also no longer a fixed array indexed by
+  row: `buildTopMenu()` composes the list once per boot from the mode, and
+  the select switch dispatches on a `TopItem` identity, so a list that
+  changes length cannot silently make `case 3:` mean something new.
+- **There is no Bluedroid in this platform's prebuilt libraries, so the
+  Arduino core's bundled `BLE` library cannot be used at all.** The
+  library is right there in
+  `framework-arduinoespressif32/libraries/BLE` (ESP32 BLE Arduino 2.0.0,
+  `BLEDevice.h`, `BLEHIDDevice.h`), which makes it look like the obvious
+  route — and so does ESP32-BLE-Gamepad / -Keyboard / -Mouse, which are
+  all built on it. But
+  `framework-arduinoespressif32-libs/esp32s3/sdkconfig` says
+  `CONFIG_BT_NIMBLE_ENABLED=y` with `# CONFIG_BT_BLUEDROID_ENABLED is not
+  set`, i.e. the host those libraries call into is not in `libbt.a`.
+  Check that sdkconfig before reaching for any BLE library, not after the
+  link errors. The host that IS there is NimBLE, and
+  `h2zero/NimBLE-Arduino` is the Arduino-facing wrapper for it —
+  including `NimBLEHIDDevice`, which builds the whole HoGP service (report
+  map, input report plus report-reference descriptor, HID info, HID
+  control point, protocol mode, plus Device Information and Battery) from
+  a report descriptor you hand it. Version 2.5.1 builds clean against
+  Arduino core 3.3.0 / IDF 5.x with no compatibility shims.
+- **The BLE name and the USB product name have to be two different
+  strings, and the binding limit is 31 bytes, not the 29 you'd expect.**
+  Two separate caps apply, and "USB Latency Tester - BLE Keyboard" (33)
+  busts both:
+  - **GAP device name, 31 bytes.** `ble_svc_gap_device_name_set()`
+    returns `BLE_HS_EINVAL` for anything longer, so the name is
+    **silently not set** and the device keeps NimBLE's default. This is
+    the nasty one: nothing fails, nothing logs, the device just has the
+    wrong name. And
+    `CONFIG_BT_NIMBLE_GAP_DEVICE_NAME_MAX_LEN` is *not* `#ifndef`-guarded
+    in NimBLE-Arduino's `nimconfig.h`, so it cannot be raised with a
+    `-D`. Note NimBLE-Arduino compiles its own copy of the NimBLE host
+    (only the controller comes from `libbt.a`), so its `nimconfig.h` is
+    what governs, not the IDF `sdkconfig`.
+  - **Advertisement name field, 29 bytes** (`BLE_HS_ADV_MAX_FIELD_SZ`).
+    NimBLE does not refuse an over-long one here — it truncates and
+    downgrades the AD type from "complete local name" to "shortened local
+    name", which would have put `USB Latency Tester - BLE Keyb` in every
+    picker.
+
+  So `modeBleName()` is a second, shorter set of strings (`Latency Tester
+  BLE Keyboard`, 27 bytes — slack against both limits rather than sitting
+  exactly on one) used for the GAP name *and* the advertisement, while
+  `modeProductName()` stays the USB product string, where neither limit
+  applies. Related ordering trap in the same place:
+  `NimBLEAdvertising::setName()` only puts the name in the scan response
+  if `enableScanResponse(true)` has *already* been called — otherwise it
+  spends the advertisement's own 31 bytes on it, which are already taken
+  by flags, appearance, the HID service UUID and the preferred connection
+  interval.
+- **`runMeasurement()`'s unyielding poll does not starve NimBLE, and the
+  reason is priority, not luck.** The existing core-0-starvation gotcha
+  says the poll deliberately never yields for up to `MEASURE_TIMEOUT_MS`,
+  and NimBLE's host and controller tasks are pinned to core 0 as well
+  (`CONFIG_BT_NIMBLE_PINNED_TO_CORE=0`) — which reads like a
+  half-second hole in every BLE measurement. It isn't: `uiTaskFn` runs at
+  priority 1 and the BLE tasks run near the top of the range
+  (`ESP_TASK_BT_CONTROLLER_PRIO` is `configMAX_PRIORITIES - 2`), so they
+  preempt the poll freely, exactly as the USB task already did. What the
+  poll starves is core 0's *idle* task and nothing else. Anything ever
+  added to core 0 at priority 1 or below, however, would genuinely be
+  blocked for the length of a measurement.
+- **A BLE send must not be treated as a USB send that happens to be
+  wireless, but `t0` still does not move.** The connection-interval wait
+  is real BLE latency and belongs inside the measurement, so `t0` is
+  still `esp_timer_get_time()` at the button edge, before the report is
+  queued, and nothing is subtracted anywhere. What was checked is the
+  other half: that `sendPress()` does not *block* `loop()`.
+  `NimBLECharacteristic::notify(value, len, connHandle)` allocates an
+  mbuf and calls `ble_gattc_notify_custom()`, which queues the ATT PDU on
+  that connection's transmit queue and returns — it neither waits for the
+  next connection event nor for an acknowledgement. (An *indication*
+  would wait for the acknowledgement. That is why this is a notification.)
+  The connection handle is passed explicitly rather than left to default
+  for a second reason: the no-handle overload walks
+  `getServer()->getPeerDevices()`, which returns a `std::vector` **by
+  value** — a heap allocation on the press path. The only thing left that
+  can block is NimBLE's host mutex, for microseconds, on the other core.
+  None of this has been timed on hardware.
+- **Connected is not the same as "a press will land", so the send path
+  gates on subscription.** A host can be connected, and even bonded,
+  without having written the input report's CCCD — and a notification
+  sent in that window goes nowhere. `bleReady` is therefore set from
+  `NimBLECharacteristicCallbacks::onSubscribe()` (bit 0 of `subValue`,
+  "notifications enabled"), not from `onConnect()`, and it is what both
+  `sendPress()` and the on-screen `LINK` tag mean. The cost is that the
+  brief connect-pair-subscribe window shows as `ADV`, which is honest:
+  nothing sent in it would have arrived.
+- **A press with nothing to send must not start a measurement.** The
+  temptation is to let it run and record the timeout — it is, after all,
+  a press that produced no photons. But a timeout means "the report went
+  out and the display didn't answer", which is a statement about the
+  machine under test, and this is "nothing went out", which is a
+  statement about the device. Recording them in the same bucket would put
+  a `MEASURE_TIMEOUT_MS` sample into the R/F statistics and a `timeout`
+  row into the run file for a reason that has nothing to do with the
+  display. So `sendPress()` returns a bool, `boardShowPress()` takes it
+  as `sent`, and the AtomS3R shows `not connected` in the headline
+  *instead of* starting the clock — and in particular does not set
+  `measureBusy`, which the automated test paces itself on and would
+  otherwise wait forever for.
+- **`pio pkg install` rewrites `platformio.ini` and deletes every comment
+  in it.** It reserialises the file from its parsed form, so the entire
+  commented rationale (the CDC-on-boot explanation, the
+  `board_build.extra_flags` restatement, the partition-table reasoning)
+  vanishes in exchange for adding one `lib_deps` line. This has already
+  happened once here and had to be restored by hand. Add dependencies by
+  editing `lib_deps` directly; `pio run` fetches whatever is missing on
+  the next build.
+- **The platform this actually builds with is not pinned.** `platform =
+  espressif32` resolves to the newest installed copy, and there are two:
+  54.03.20 and 55.03.30 (Arduino core 3.3.0 / IDF 5.5). Builds currently
+  pick **55.3.30**, not the 54.03.20 the project was originally developed
+  against. Nothing has broken because of it, but a build that suddenly
+  behaves differently after an unrelated `pio pkg update` is worth
+  suspecting here first — pin the version in `[env]` if that ever
+  matters.
 - **Don't move or resize the `nvs` partition.** `partitions_atoms3r_8MB.csv`
   keeps it at `0x9000`, size `0x5000`, identical to the stock
   `default_8MB.csv` the AtomS3 board profile ships. That's what lets an
   existing device be reflashed with the new table and still come up in the
-  mode it was left in — the mode selection, and now the run counter, both
-  live in NVS. A table that shifted `nvs` by even one sector would
-  silently reset every device back to gamepad mode, and it would look like
-  a firmware bug rather than a partitioning one.
+  mode it was left in — the mode selection, the run counter, and now
+  NimBLE's bonds all live in NVS. A table that shifted `nvs` by even one
+  sector would silently reset every device back to gamepad mode and
+  forget every host it had ever paired with, and it would look like
+  a firmware bug rather than a partitioning one. The same applies to the
+  S3-Zero's stock `default.csv`, which puts `nvs` at the same place.
 - **The `ffat` partition is formatted on first mount, and the screen is
   black while that happens.** `FFat.begin(true)` — format-on-fail — is
   required, not optional: a device flashed with this table for the first

@@ -10,7 +10,11 @@
  *   env:m5stack-atoms3r  -> board_atoms3r.cpp  (screen button, 128x128 LCD)
  *
  * Everything mode-related is passed in rather than kept here, so the
- * board layer holds no copy of state main.cpp already owns.
+ * board layer holds no copy of state main.cpp already owns. Nothing in a
+ * board_*.cpp touches USB or the radio — those belong to main.cpp alone,
+ * which is why anything BLE-shaped in this contract (boardShowLink(),
+ * appBlePairingMode()) is a value being pushed down or a request being
+ * passed up, never a call into NimBLE.
  */
 #pragma once
 
@@ -116,7 +120,43 @@ void boardShowBoot(Mode active, Mode pending);
 // before the HID report was queued — i.e. t0 for any measurement of how
 // long the machine takes to respond. A board with a light sensor starts
 // its clock from this; one without just ignores it.
-void boardShowPress(bool pressed, Mode active, int64_t atMicros);
+//
+// `sent` is false when the press produced no report at all, which in
+// practice means a BLE mode with no host connected (see boardShowLink()
+// below). It matters because the honest response to it is to NOT start a
+// measurement: nothing left the device, so nothing is going to change on
+// the display, and timing that would only add a guaranteed
+// MEASURE_TIMEOUT_MS sample to the statistics and a `timeout` row to any
+// run file. A board should show the press somehow and skip the clock.
+void boardShowPress(bool pressed, Mode active, int64_t atMicros, bool sent);
+
+// --- BLE link state ----------------------------------------------------
+// Only meaningful in one of the three BLE modes; main.cpp pushes it
+// whenever the radio's state changes, which includes from inside NimBLE's
+// own callbacks on the host task — so an implementation must be as cheap
+// as every other cross-core entry point here (one store and a poke), not
+// draw anything itself.
+//
+// Why the board needs it at all: in a BLE mode a press only does
+// something when a host is connected, and "nothing happened" is otherwise
+// indistinguishable from a broken button. The state is shown
+// continuously rather than as a reaction to a press, because on the one
+// board that has a screen the screen cannot repaint promptly anyway (see
+// the measurement comment in board_atoms3r.cpp).
+enum LinkState : uint8_t {
+  LINK_NONE,         // not a BLE mode; nothing to show
+  LINK_ADVERTISING,  // radio up, waiting for a host to connect
+  LINK_PAIRING,      // as above, but bonds were just cleared (see appBlePairingMode)
+  LINK_CONNECTED,    // a host is connected; presses go somewhere
+};
+void boardShowLink(LinkState state);
+
+// Implemented in main.cpp; called by the board's menu "Pairing" item,
+// which only exists in a BLE mode. See main.cpp for what pairing mode
+// concretely does — the short version is that it forgets every bonded
+// host and starts advertising again, because a stale bond, not a lack of
+// discoverability, is what actually stops a new host connecting.
+void appBlePairingMode();
 
 // Called after a hold has advanced the pending mode — the mode a future
 // reboot will come up in, which is not the one running now.
@@ -196,7 +236,7 @@ struct RunRecord {
 void boardWriteRun(const RunRecord &run);
 
 // --- USB mass storage --------------------------------------------------
-// A fourth USB identity (MODE_STORAGE), on boards that have a filesystem
+// A seventh identity (MODE_STORAGE), on boards that have a filesystem
 // partition worth exposing: instead of a HID device, the board enumerates
 // as a small thumb drive whose blocks ARE the `ffat` partition, so the
 // host mounts the run CSVs directly with no firmware in the loop.

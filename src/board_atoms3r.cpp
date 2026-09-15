@@ -43,10 +43,27 @@
  *
  *     24.38 ms                <- last measurement, coloured by direction
  *   R6 24.9  F7 41.2           <- per-direction n/mean
- *      GAMEPAD                 <- mode this boot enumerated as
+ *      GAMEPAD                 <- mode this boot came up as
  *   hold: reset stats          <- next hold rung, or the pending mode
  *   [ histogram, R/F stacked,  <- last HIST_CAPACITY samples of each
  *     min/max labelled ]          direction, same colour scheme as above
+ *
+ * In a BLE mode the mode line carries a second field, right-aligned,
+ * because a press there only does something when a host is listening and
+ * "nothing happened" would otherwise be indistinguishable from a broken
+ * button:
+ *
+ *   BLE KEYBOARD      LINK     <- connected; presses go somewhere
+ *   BLE KEYBOARD       ADV     <- advertising, nobody connected
+ *   BLE KEYBOARD      PAIR     <- as above, just after bonds were dropped
+ *
+ * It lives on the mode line rather than the line below because that line
+ * is already contended (automated run > armed drive > pending mode >
+ * hold hint) and because the link is a property of the identity, which is
+ * what the mode line is for. The press-time half of the same story is the
+ * headline: a press with no link shows "not connected" there and starts
+ * NO measurement, since nothing left the device and timing it would only
+ * bank a guaranteed MEASURE_TIMEOUT_MS into the statistics.
  *
  * There is no separate action box or press indicator: this board has no
  * accessible RGB LED (see the gotcha in CLAUDE.md — the LP5562 exists and
@@ -60,13 +77,22 @@
  * (see board.h for the full normal/menu button contract — this file just
  * implements it):
  *
- *      MENU                    MENU_TOP: five items, cycled by tap,
- *    > Light meter              triggered by a 1s+ hold. Light meter
- *      Auto test                flips meterView and exits; Auto test
- *      USB drive                hands off to main.cpp (which owns USB,
- *      Change mode              so it owns the presses) and exits;
- *      Exit                     USB drive and Change mode drop into the
- *   tap: next  hold: select     two pickers below; Exit just leaves.
+ *      MENU                    MENU_TOP: five items, or six in a BLE
+ *    > Light meter              mode, cycled by tap and triggered by a
+ *      Auto test                1s+ hold. Light meter flips meterView
+ *      USB drive                and exits; Auto test and Pairing hand
+ *      Change mode              off to main.cpp (which owns USB and the
+ *      Pairing                  radio, so it owns both) and exit; USB
+ *      Exit                     drive and Change mode drop into the two
+ *   tap: next  hold: select     pickers below; Exit just leaves.
+ *
+ *                               Pairing exists only in a BLE mode — see
+ *                               buildTopMenu() below, and
+ *                               appBlePairingMode() in main.cpp for what
+ *                               it does. In a USB mode the item is not
+ *                               hidden-but-present, it is simply not in
+ *                               the list, so it cannot be cycled past
+ *                               either.
  *
  *   CHANGE MODE                MENU_MODE: tap advances the candidate via
  *     KEYBOARD                  appAdvancePendingMode() — the same NVS
@@ -285,10 +311,39 @@ static volatile uint16_t autoTotal = 0;
 enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE };
 static volatile MenuState menuState = MENU_NONE;
 static int topIndex = 0;
-static const int NUM_TOP_ITEMS = 5;
-static const char *TOP_ITEM_LABELS[NUM_TOP_ITEMS] = {
-  "Light meter", "Auto test", "USB drive", "Change mode", "Exit"
+
+// The top menu's items are identified by these rather than by their row,
+// because the row a given item sits on now depends on the boot: Pairing
+// is in the list only in a BLE mode, where it is the one thing the user
+// may actually need and where, in a USB mode, it would be an item that
+// does nothing. Selecting by identity means the switch below cannot
+// silently start doing the wrong thing when the list changes length.
+enum TopItem : uint8_t {
+  ITEM_METER,
+  ITEM_AUTO,
+  ITEM_DRIVE,
+  ITEM_MODE,
+  ITEM_PAIR,   // BLE modes only
+  ITEM_EXIT,
+  ITEM_KINDS,
 };
+static const char *TOP_ITEM_LABELS[ITEM_KINDS] = {
+  "Light meter", "Auto test", "USB drive", "Change mode", "Pairing", "Exit"
+};
+// Built once per boot by buildTopMenu(), from the mode. Fixed for the
+// life of the boot, exactly like the mode it is derived from, so nothing
+// has to think about the list changing under a live topIndex.
+static TopItem topItems[ITEM_KINDS];
+static int numTopItems = 0;
+
+// The BLE link, as pushed down from main.cpp (see boardShowLink()).
+// LINK_NONE in every non-BLE mode, which is what keeps every BLE-shaped
+// branch in this file inert on the other four.
+static volatile LinkState wantLink = LINK_NONE;
+// Set by boardShowPress() when a press produced no report at all, and
+// consumed by uiTaskFn. Not a measurement, deliberately: see the file
+// header.
+static volatile bool noLinkPress = false;
 
 // Set by boardShowStorageEjected() from the TinyUSB task, read by uiTask.
 // Only meaningful in a MODE_STORAGE boot, and only ever goes one way: the
@@ -300,6 +355,11 @@ static volatile bool storageEjected = false;
 // why a photoresistor's two directions are not expected to be the same.
 static const int32_t LAT_NONE = -1;     // nothing measured yet
 static const int32_t LAT_TIMEOUT = -2;  // the light never crossed
+// A press in a BLE mode with no host listening. Distinct from a timeout
+// on purpose: a timeout means the report went out and the display didn't
+// answer, which is a result about the machine under test; this means
+// nothing went out at all, which is a result about the device.
+static const int32_t LAT_NOLINK = -3;
 static int32_t lastLatencyUs = LAT_NONE;
 static bool lastLatencyWasRise = false;  // which bucket lastLatencyUs is in
 
@@ -345,12 +405,39 @@ static uint16_t riseColor() { return display.color565(120, 220, 230); }  // cyan
 static uint16_t fallColor() { return display.color565(255, 130, 220); }  // magenta
 static uint16_t dimColor() { return display.color565(110, 110, 110); }
 
+// Same three hues for the same three actions, with the BLE family shifted
+// to the secondaries — matching the S3-Zero's LED table exactly, so a
+// colour means the same thing on both boards. See board_s3zero.cpp.
 static uint16_t modeColor(Mode mode) {
   switch (mode) {
-    case MODE_GAMEPAD:  return display.color565(255,  72,  56);  // red
-    case MODE_KEYBOARD: return display.color565( 48, 214,  96);  // green
-    case MODE_MOUSE:    return display.color565( 72, 150, 255);  // blue
-    default:            return display.color565(255, 255, 255);
+    case MODE_GAMEPAD:      return display.color565(255,  72,  56);  // red
+    case MODE_KEYBOARD:     return display.color565( 48, 214,  96);  // green
+    case MODE_MOUSE:        return display.color565( 72, 150, 255);  // blue
+    case MODE_BLE_GAMEPAD:  return display.color565(255, 190,  40);  // yellow
+    case MODE_BLE_KEYBOARD: return display.color565( 90, 224, 214);  // cyan
+    case MODE_BLE_MOUSE:    return display.color565(230, 110, 230);  // magenta
+    default:                return display.color565(255, 255, 255);
+  }
+}
+
+// The right-hand field of the mode line in a BLE mode. Four characters at
+// most: Font0 is a 6px cell, the mode name can be twelve characters
+// ("BLE KEYBOARD"), and 12 + 4 plus a gap is all 21 cells of the panel
+// will take.
+static const char *linkTag(LinkState link) {
+  switch (link) {
+    case LINK_CONNECTED:   return "LINK";
+    case LINK_PAIRING:     return "PAIR";
+    case LINK_ADVERTISING: return "ADV";
+    default:               return "";
+  }
+}
+
+static uint16_t linkColor(LinkState link) {
+  switch (link) {
+    case LINK_CONNECTED:   return display.color565( 48, 214,  96);  // green
+    case LINK_PAIRING:     return display.color565(255, 190,  40);  // amber
+    default:               return display.color565(110, 110, 110);  // dim
   }
 }
 
@@ -469,6 +556,9 @@ static void drawLatencyStrip() {
   } else if (lastLatencyUs == LAT_TIMEOUT) {
     snprintf(top, sizeof(top), "no change");
     topColor = warn;
+  } else if (lastLatencyUs == LAT_NOLINK) {
+    snprintf(top, sizeof(top), "not connected");
+    topColor = warn;
   } else {
     uint32_t us = (uint32_t)lastLatencyUs;
     snprintf(top, sizeof(top), "%u.%02u ms", us / 1000, (us % 1000) / 10);
@@ -506,16 +596,37 @@ static void drawTopStrip(int raw, uint32_t mv) {
   }
 }
 
-// The mode name, in its colour. Only ever drawn as part of a full frame
-// (a mode change is one of the conditions that triggers one), so it
-// doesn't need to manage its own incremental redraw.
-static void drawModeLine(Mode active) {
+// The mode name, in its colour — plus, in a BLE mode only, the link state
+// right-aligned beside it. Two draws rather than one string because the
+// two fields want two colours: the mode keeps its own identity colour
+// whatever the radio is doing, and the tag carries green/amber/dim for
+// connected/pairing/advertising.
+//
+// Only ever drawn as part of a full frame (a mode change and a link
+// change are both conditions that trigger one), so it doesn't need to
+// manage its own incremental redraw.
+static void drawModeLine(Mode active, LinkState link) {
   display.setFont(&fonts::Font0);
-  display.setTextDatum(textdatum_t::top_center);
-  display.setTextColor(modeColor(active), black());
-  display.setTextPadding(SCREEN_W);
-  display.drawString(modeName(active), SCREEN_W / 2, MODE_Y);
+
+  if (!modeIsBle(active)) {
+    display.setTextDatum(textdatum_t::top_center);
+    display.setTextColor(modeColor(active), black());
+    display.setTextPadding(SCREEN_W);
+    display.drawString(modeName(active), SCREEN_W / 2, MODE_Y);
+    display.setTextPadding(0);
+    return;
+  }
+
+  // Two fields means neither can clear the line with text padding without
+  // erasing the other, so the line is cleared once up front instead.
+  display.fillRect(0, MODE_Y, SCREEN_W, 8, black());
   display.setTextPadding(0);
+  display.setTextDatum(textdatum_t::top_left);
+  display.setTextColor(modeColor(active), black());
+  display.drawString(modeName(active), 2, MODE_Y);
+  display.setTextDatum(textdatum_t::top_right);
+  display.setTextColor(linkColor(link), black());
+  display.drawString(linkTag(link), SCREEN_W - 2, MODE_Y);
 }
 
 // Either the mode change already queued up and waiting on a reboot (see
@@ -642,9 +753,9 @@ static void drawHistogram() {
   display.drawString(hiBuf, SCREEN_W - 1, HIST_LABEL_Y);
 }
 
-// MENU_TOP: the three items, one per line, with the current selection
-// picked out in amber. A tap (below) cycles topIndex; a hold (below)
-// triggers whichever item is highlighted.
+// MENU_TOP: the items of this boot's menu, one per line, with the current
+// selection picked out in amber. A tap (below) cycles topIndex; a hold
+// (below) triggers whichever item is highlighted.
 static void drawMenuTop() {
   uint16_t dim = dimColor();
   uint16_t hi = display.color565(255, 190, 40);  // amber, matches the pending-mode colour
@@ -654,14 +765,18 @@ static void drawMenuTop() {
   display.setTextColor(dim, black());
   display.drawString("MENU", SCREEN_W / 2, 6);
 
-  // Five items at the old 16px pitch would run into the hint lines at
-  // y=96, so the block is a little tighter and starts a little higher.
-  const int rowH = 14;
-  const int top = 22;
+  // Six items (a BLE mode's list) at the previous 14px pitch from y=22
+  // would put the last row at y=92, overlapping the "tap: next" hint at
+  // y=96. 12px from y=20 lands it at y=80 with eight clear pixels below,
+  // and Font0 is 8px tall so a 12px pitch still leaves a visible gap
+  // between rows. That is the panel full: a seventh item needs a
+  // scrolling menu, not another row.
+  const int rowH = 12;
+  const int top = 20;
   char buf[24];
-  for (int i = 0; i < NUM_TOP_ITEMS; i++) {
+  for (int i = 0; i < numTopItems; i++) {
     bool selected = (i == topIndex);
-    snprintf(buf, sizeof(buf), selected ? "> %s" : "%s", TOP_ITEM_LABELS[i]);
+    snprintf(buf, sizeof(buf), selected ? "> %s" : "%s", TOP_ITEM_LABELS[topItems[i]]);
     display.setTextColor(selected ? hi : dim, black());
     display.drawString(buf, SCREEN_W / 2, top + i * rowH);
   }
@@ -784,7 +899,8 @@ static void drawMenuDrive(Mode pending) {
   display.drawString("hold: toggle", SCREEN_W / 2, 106);
 }
 
-static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung hint) {
+static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung hint,
+                      LinkState link) {
   display.startWrite();
   display.fillScreen(black());
 
@@ -798,7 +914,7 @@ static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung 
     drawMenuDrive(pending);
   } else {
     drawTopStrip(raw, mv);
-    drawModeLine(active);
+    drawModeLine(active, link);
     drawNextLine(active, pending, hint);
     drawHistogram();
   }
@@ -847,6 +963,10 @@ static void uiTaskFn(void *) {
   HoldRung shownHint = RUNG_STATS;
   MenuState shownMenuState = MENU_TOP;  // != MENU_NONE, same forcing trick
   int shownTopIndex = -1;
+  // 0xFF is not a LinkState, so the first pass draws — same forcing trick
+  // again, and it has to be one: LINK_NONE is a real value here (every
+  // non-BLE mode sits in it forever).
+  LinkState shownLink = (LinkState)0xFF;
   uint16_t shownAutoDone = 0xFFFF;      // != any real count, same trick again
   uint16_t shownAutoTotal = 0xFFFF;
   int shownRaw = -1;
@@ -864,6 +984,10 @@ static void uiTaskFn(void *) {
     Mode active = wantActive;
     Mode pending = wantPending;
     HoldRung hint = wantHint;
+    // wantLink is read below, AFTER the menu requests are serviced, not
+    // here with the others: selecting the Pairing item changes the link
+    // state inside that block, and a snapshot taken up here would draw
+    // the frame that leaves the menu with the old tag still on it.
 
     // Requests from loop() on the other core. Both are deferred to here
     // so that the stats and the view stay single-threaded on core 0.
@@ -889,7 +1013,7 @@ static void uiTaskFn(void *) {
     if (menuTapRequested) {
       menuTapRequested = false;
       if (menuState == MENU_TOP) {
-        topIndex = (topIndex + 1) % NUM_TOP_ITEMS;
+        topIndex = (topIndex + 1) % numTopItems;
       } else if (menuState == MENU_MODE) {
         appAdvancePendingMode();
       } else if (menuState == MENU_STORAGE) {
@@ -904,15 +1028,25 @@ static void uiTaskFn(void *) {
     if (menuSelectRequested) {
       menuSelectRequested = false;
       if (menuState == MENU_TOP) {
-        switch (topIndex) {
-          case 0: meterView = !meterView; menuState = MENU_NONE; break;  // Light meter
+        switch (topItems[topIndex]) {
+          case ITEM_METER: meterView = !meterView; menuState = MENU_NONE; break;
           // Close the menu on the way out so the run is visible as it
           // goes; main.cpp waits for the button to come up before its
           // first press, so this hold can't leak into the data.
-          case 1: appStartAutoTest(); menuState = MENU_NONE; break;      // Auto test
-          case 2: menuState = MENU_STORAGE; break;                       // USB drive
-          case 3: menuState = MENU_MODE; break;                          // Change mode
-          case 4: menuState = MENU_NONE; break;                          // Exit
+          case ITEM_AUTO:  appStartAutoTest(); menuState = MENU_NONE; break;
+          case ITEM_DRIVE: menuState = MENU_STORAGE; break;
+          case ITEM_MODE:  menuState = MENU_MODE; break;
+          // Pairing has no picker of its own and nothing to confirm: it
+          // is a single irreversible-ish act (bonds gone, advertising
+          // restarted) whose result shows up on the mode line's link tag
+          // a moment later, so the menu just gets out of the way. Note it
+          // erases NVS and therefore stalls the flash cache on both
+          // cores — harmless precisely here, with no run going and no
+          // measurement outstanding, and the same licence boardWriteRun()
+          // has.
+          case ITEM_PAIR:  appBlePairingMode(); menuState = MENU_NONE; break;
+          case ITEM_EXIT:  menuState = MENU_NONE; break;
+          default: break;
         }
       } else if (menuState == MENU_MODE || menuState == MENU_STORAGE) {
         // Both pickers persist per tap — nothing to do here but leave.
@@ -927,6 +1061,8 @@ static void uiTaskFn(void *) {
       }
     }
 
+    LinkState link = wantLink;  // see the note where the others are read
+
     bool inMenu = (menuState != MENU_NONE);
     bool storageScreen = (menuState == MENU_STORAGE || menuState == MENU_DRIVE);
     bool armed = storageScreen && appStorageArmed();
@@ -934,7 +1070,8 @@ static void uiTaskFn(void *) {
     bool newFrame = (active != shownActive || pending != shownPending ||
                      meterView != shownMeter ||
                      menuState != shownMenuState || topIndex != shownTopIndex ||
-                     armed != shownArmed || ejected != shownEjected);
+                     armed != shownArmed || ejected != shownEjected ||
+                     link != shownLink);
     // A clear only shows up in the measure view's top strip; the meter
     // view is live anyway and will repaint on its own cadence. The
     // histogram is visible in both views, so it always needs redrawing.
@@ -956,6 +1093,19 @@ static void uiTaskFn(void *) {
       if (!meterView) topDirty = true;
     }
 
+    // A press that produced no report — a BLE mode with nobody listening.
+    // It deliberately does not go through runMeasurement(): nothing left
+    // the device, so nothing is going to change on the display, and the
+    // MEASURE_TIMEOUT_MS the poll would burn would land in the stats and
+    // in any run file as a timeout that says something quite untrue about
+    // the machine under test. The headline says so instead, and the
+    // statistics are left exactly as they were.
+    if (noLinkPress) {
+      noLinkPress = false;
+      lastLatencyUs = LAT_NOLINK;
+      if (!meterView) topDirty = true;
+    }
+
     if (meterView) {
       uint32_t now = millis();
       if (shownRaw < 0 || (uint32_t)(now - lastSampleMs) >= LIGHT_PERIOD_MS) {
@@ -971,8 +1121,9 @@ static void uiTaskFn(void *) {
 
     if (displayReady) {
       if (newFrame) {
-        drawFrame(active, pending, raw, mv, hint);
+        drawFrame(active, pending, raw, mv, hint, link);
         shownActive = active;
+        shownLink = link;
         shownPending = pending;
         shownMeter = meterView;
         shownHint = hint;
@@ -1264,9 +1415,31 @@ bool boardButtonPressed() {
   return digitalRead(SCREEN_BUTTON_PIN) == LOW;  // active-low
 }
 
+// Which items this boot's top menu has. Called once, from boardShowBoot()
+// on core 1 before uiTaskFn exists, so there is nobody to race: the mode
+// is fixed for the life of the boot (see mode.h), so the list derived
+// from it is too, and topIndex can never be pointed at an item that
+// stopped existing.
+//
+// Pairing is in only in a BLE mode. Not greyed out, not present-but-inert
+// — absent, so tapping through the menu in a USB mode is exactly the menu
+// it always was. Nothing else is conditional: USB drive and Auto test are
+// as useful over the radio as over the wire, which is rather the point of
+// having BLE modes at all.
+static void buildTopMenu(Mode active) {
+  numTopItems = 0;
+  topItems[numTopItems++] = ITEM_METER;
+  topItems[numTopItems++] = ITEM_AUTO;
+  topItems[numTopItems++] = ITEM_DRIVE;
+  topItems[numTopItems++] = ITEM_MODE;
+  if (modeIsBle(active)) topItems[numTopItems++] = ITEM_PAIR;
+  topItems[numTopItems++] = ITEM_EXIT;
+}
+
 void boardShowBoot(Mode active, Mode pending) {
   wantActive = active;
   wantPending = pending;
+  buildTopMenu(active);
   // Set here, on core 1, rather than left for the task to notice: main.cpp
   // starts calling boardMenuActive() on its very first loop() pass, which
   // can beat a freshly created task to its first iteration. A storage boot
@@ -1282,9 +1455,19 @@ void boardShowBoot(Mode active, Mode pending) {
   xTaskCreatePinnedToCore(uiTaskFn, "atoms3r-ui", 8192, nullptr, 1, &uiTask, 0);
 }
 
-void boardShowPress(bool pressed, Mode active, int64_t atMicros) {
+void boardShowPress(bool pressed, Mode active, int64_t atMicros, bool sent) {
   wantActive = active;
   if (pressed) {
+    if (!sent) {
+      // Nothing was transmitted, so there is nothing to time. Raise the
+      // headline flag instead of the measurement one, and in particular
+      // do NOT set measureBusy — the automated test paces itself on that
+      // flag, and a run that set it here would wait out a measurement
+      // that is never going to be started.
+      noLinkPress = true;
+      nudgeUi();
+      return;
+    }
     // Hand the edge timestamp over and let the task start its clock from
     // it. Note the consequence: the on-screen numbers don't update until
     // the measurement finishes, because the task must not be painting
@@ -1296,6 +1479,15 @@ void boardShowPress(bool pressed, Mode active, int64_t atMicros) {
     measureBusy = true;
     measurePending = true;
   }
+  nudgeUi();
+}
+
+// Called from main.cpp, which is itself often inside a NimBLE callback on
+// the host task when it calls this — a third core-crossing on top of the
+// two this file already has. Same treatment as all of them: one store and
+// a poke, nothing drawn here.
+void boardShowLink(LinkState state) {
+  wantLink = state;
   nudgeUi();
 }
 

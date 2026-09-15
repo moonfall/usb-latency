@@ -2,10 +2,29 @@
  * Board layer for the Waveshare ESP32-S3-Zero: BOOT button (GPIO0,
  * active-low) as the input, onboard WS2812 (GPIO21) as the indicator.
  *
- * The LED encodes the mode as a colour (red/green/blue) and is only lit
- * while the button is held. Modes are otherwise invisible on this board,
- * which is why boot flashes the active mode's colour briefly — without it
- * you'd have to press the button to find out what the device is.
+ * The LED encodes the mode as a colour and is only lit while the button
+ * is held. Modes are otherwise invisible on this board, which is why boot
+ * flashes the active mode's colour briefly — without it you'd have to
+ * press the button to find out what the device is.
+ *
+ * Six modes and one RGB LED means the colours are the three primaries for
+ * the USB family and the three secondaries for the BLE one:
+ *
+ *   GAMEPAD  red      BLE GAMEPAD   yellow
+ *   KEYBOARD green    BLE KEYBOARD  cyan
+ *   MOUSE    blue     BLE MOUSE     magenta
+ *
+ * The pairing is arbitrary — there is no colour that means "the same
+ * thing but over the radio" — but six distinguishable colours on a device
+ * with no other output is worth more than a mnemonic. The table above is
+ * the reference; it is also in CLAUDE.md.
+ *
+ * BLE on this board has no pairing gesture and no link display, which is
+ * a deliberate refusal rather than an omission. See boardShowLink() below
+ * for the whole argument, and note the one thing the LED does say: a
+ * press that went nowhere (a BLE mode with no host listening) lights the
+ * mode colour DIM instead of full, so "nothing happened" and "nothing
+ * could have happened" are not the same picture.
  *
  * Do not press/hold BOOT while plugging in via a normal (non-flashing)
  * USB session; GPIO0 low at reset is how the ROM bootloader is asked for
@@ -30,11 +49,22 @@ static inline void setPixel(uint8_t r, uint8_t g, uint8_t b) {
   rgbLedWrite(RGB_LED_PIN, g, r, b);
 }
 
-static inline void showModeColor(Mode mode) {
+// `level` is the per-channel value a lit channel gets: LEVEL_ON normally,
+// LEVEL_DIM for a press in a BLE mode that had nowhere to go. Dim rather
+// than off, and rather than some fourth colour, because the useful
+// message is "this press, in this mode, reached nobody" — keeping the hue
+// keeps the mode readable while the brightness carries the rest.
+static const uint8_t LEVEL_ON = 40;
+static const uint8_t LEVEL_DIM = 5;
+
+static inline void showModeColor(Mode mode, uint8_t level = LEVEL_ON) {
   switch (mode) {
-    case MODE_GAMEPAD:  setPixel(40, 0, 0); break;  // red
-    case MODE_KEYBOARD: setPixel(0, 40, 0); break;  // green
-    case MODE_MOUSE:    setPixel(0, 0, 40); break;  // blue
+    case MODE_GAMEPAD:      setPixel(level, 0, 0); break;      // red
+    case MODE_KEYBOARD:     setPixel(0, level, 0); break;      // green
+    case MODE_MOUSE:        setPixel(0, 0, level); break;      // blue
+    case MODE_BLE_GAMEPAD:  setPixel(level, level, 0); break;  // yellow
+    case MODE_BLE_KEYBOARD: setPixel(0, level, level); break;  // cyan
+    case MODE_BLE_MOUSE:    setPixel(level, 0, level); break;  // magenta
     default: break;
   }
 }
@@ -86,13 +116,40 @@ void boardShowBoot(Mode active, Mode pending) {
   setPixel(0, 0, 0);
 }
 
-void boardShowPress(bool pressed, Mode active, int64_t atMicros) {
+void boardShowPress(bool pressed, Mode active, int64_t atMicros, bool sent) {
   (void)atMicros;  // nothing here to measure the machine's response with
   if (pressed) {
-    showModeColor(active);
+    // The only use this board has for `sent`: a BLE press with no host
+    // listening lights dim rather than full. There is no measurement to
+    // suppress here (no sensor), so that is the whole of it.
+    showModeColor(active, sent ? LEVEL_ON : LEVEL_DIM);
   } else {
     setPixel(0, 0, 0);
   }
+}
+
+// Nothing to show it on, and deliberately so.
+//
+// The temptation is to light the LED continuously in a BLE mode to say
+// "connected" — and it would be wrong twice over. The LED is lit only
+// while the button is held, which is what makes it readable at all on a
+// board whose entire output is one pixel; turning it into a status lamp
+// would cost that and gain a second, contradictory meaning for the same
+// colour. And the state it would report is the one the next press
+// reports anyway, more usefully, via `sent` above.
+//
+// Pairing, likewise, has no gesture here. This board's BLE story is
+// simply: it advertises from boot, it re-advertises whenever a host goes
+// away, and any host that has not bonded with it can pair. That covers
+// every case except a stale bond — a host that has forgotten the device
+// while the device still holds a key for it — for which the way out is
+// to forget the device on the host, or, failing that, to erase flash.
+// The alternative was inventing a second hold gesture on a button that
+// already carries press-to-send and hold-to-cycle-mode, on a board with
+// no way to show that the gesture had been recognised. One gesture more
+// than the indicator can explain is worse than none.
+void boardShowLink(LinkState state) {
+  (void)state;
 }
 
 void boardShowPending(Mode active, Mode pending, bool firstOfHold) {
