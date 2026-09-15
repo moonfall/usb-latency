@@ -155,8 +155,10 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <esp_mac.h>
 #include <esp_random.h>
 #include <esp_timer.h>
+#include <nvs.h>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 #include <USB.h>
@@ -564,6 +566,132 @@ class BleInputCallbacks : public NimBLECharacteristicCallbacks {
 static BleCallbacks bleCallbacks;
 static BleInputCallbacks bleInputCallbacks;
 
+// --- One BLE identity, and one bond store, per BLE mode -----------------
+//
+// The three BLE modes present three different HID report maps, and a
+// host caches both the GATT database and its pairing keys *per device
+// address*. Give all three modes one address and switching modes breaks
+// the device twice over: the host's cached report map no longer matches
+// what the device serves (input goes dead until the host forgets the
+// device), and on this side NimBLE's bond store is keyed by *peer* — so
+// pairing the same host in a second mode overwrites the first mode's
+// keys, and switching back fails encryption even though the host kept
+// its half. The observed symptom of both together: forget-and-re-pair on
+// every mode switch.
+//
+// Fixed by making each mode a genuinely different Bluetooth device:
+//
+//  * Identity: a per-mode static random address, derived from the chip's
+//    BT MAC with the mode index mixed into the low byte (and the top two
+//    bits forced to 0b11, which is what makes a random address "static").
+//    Hosts then see three devices, each with its own cache and pairing.
+//  * Bonds: NimBLE persists bonds as blobs in NVS namespace
+//    "nimble_bond" (ble_store_nvs.c), with no per-identity separation —
+//    so the whole namespace is banked per mode instead. On a BLE boot,
+//    if the last BLE boot was a different mode, the live namespace is
+//    copied out to that mode's bank, wiped, and the booting mode's bank
+//    copied in. Non-BLE boots touch none of it. A pleasant consequence:
+//    the pairing menu item's deleteAllBonds() now only ever clears the
+//    active mode's bonds, which is exactly what "re-pair this mode"
+//    should mean.
+//
+// The banking runs in setup(), strictly before NimBLEDevice::init() —
+// the store must be settled before the host stack first reads it.
+
+static const char *BLE_LIVE_NAMESPACE = "nimble_bond";
+
+// Which mode's bonds currently sit in the live namespace. Lives beside
+// the other persisted mode state. 0xFF = unknown (pre-banking firmware,
+// or no BLE boot yet).
+static const char *PREFS_BOND_OWNER_KEY = "bondowner";
+
+static void bleBankNamespaceName(Mode mode, char *out, size_t outLen) {
+  snprintf(out, outLen, "bondbank_%d", (int)mode);
+}
+
+// Copy every entry of one NVS namespace over another (destination is
+// wiped first). The bond store is blob-only (verified against
+// ble_store_nvs.c in the pinned library), but the copy handles all types
+// blobs-included via the blob API only after checking, so a future store
+// entry of another type fails loudly here rather than silently skewing.
+static void bleCopyNamespace(const char *from, const char *to) {
+  nvs_handle_t src, dst;
+  if (nvs_open(from, NVS_READONLY, &src) != ESP_OK) return;  // nothing to copy
+  if (nvs_open(to, NVS_READWRITE, &dst) != ESP_OK) {
+    nvs_close(src);
+    return;
+  }
+  nvs_erase_all(dst);
+
+  nvs_iterator_t it = nullptr;
+  esp_err_t err = nvs_entry_find(NVS_DEFAULT_PART_NAME, from, NVS_TYPE_BLOB, &it);
+  while (err == ESP_OK) {
+    nvs_entry_info_t info;
+    nvs_entry_info(it, &info);
+    size_t len = 0;
+    if (nvs_get_blob(src, info.key, nullptr, &len) == ESP_OK && len > 0) {
+      uint8_t *buf = (uint8_t *)malloc(len);
+      if (buf) {
+        if (nvs_get_blob(src, info.key, buf, &len) == ESP_OK) {
+          nvs_set_blob(dst, info.key, buf, len);
+        }
+        free(buf);
+      }
+    }
+    err = nvs_entry_next(&it);
+  }
+  nvs_release_iterator(it);
+  nvs_commit(dst);
+  nvs_close(dst);
+  nvs_close(src);
+}
+
+static void bleEraseNamespace(const char *ns) {
+  nvs_handle_t h;
+  if (nvs_open(ns, NVS_READWRITE, &h) != ESP_OK) return;
+  nvs_erase_all(h);
+  nvs_commit(h);
+  nvs_close(h);
+}
+
+// Park the previous BLE mode's bonds and pull in this one's. Called only
+// on a BLE boot; on a USB or storage boot the live namespace just keeps
+// whatever it holds, still tagged with its owner.
+static void bleBankSwitch(Mode mode) {
+  uint8_t owner = prefs.getUChar(PREFS_BOND_OWNER_KEY, 0xFF);
+  if (owner == (uint8_t)mode) return;  // already ours, nothing to move
+
+  char bank[16];
+  if (owner != 0xFF && modeIsBle((Mode)owner)) {
+    // Park the previous owner's bonds in its bank.
+    bleBankNamespaceName((Mode)owner, bank, sizeof(bank));
+    bleCopyNamespace(BLE_LIVE_NAMESPACE, bank);
+  }
+  // 0xFF (firmware that predates banking, or a fresh chip): whatever is
+  // in the live namespace was shared by all three modes and is stale for
+  // at least two of them. Adopting it unparked would hand one mode keys
+  // the host may associate with a *different* identity now that per-mode
+  // addresses exist — so it is wiped rather than adopted, one final
+  // re-pair per mode as the migration cost.
+  bleEraseNamespace(BLE_LIVE_NAMESPACE);
+  bleBankNamespaceName(mode, bank, sizeof(bank));
+  bleCopyNamespace(bank, BLE_LIVE_NAMESPACE);
+  prefs.putUChar(PREFS_BOND_OWNER_KEY, (uint8_t)mode);
+}
+
+// The per-mode identity address: the chip's BT MAC with the mode index
+// mixed into the low byte, top two bits forced to 0b11 (the static
+// random marker — hosts treat anything else in a random slot as
+// malformed). NimBLE takes addresses little-endian, so out[5] is the
+// most significant byte.
+static void bleIdentityFor(Mode mode, uint8_t out[6]) {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_BT);
+  for (int i = 0; i < 6; i++) out[i] = mac[5 - i];  // big->little endian
+  out[0] ^= (uint8_t)mode;  // low byte: what makes the three differ
+  out[5] |= 0xC0;           // static random address marker
+}
+
 // Build the GATT database for this boot's BLE identity and start
 // advertising. Called once from setup(), only in a BLE mode — the same
 // only-construct-what-this-boot-is rule the USB device classes follow,
@@ -593,10 +721,23 @@ static void bleBegin(Mode mode) {
       return;  // not a BLE boot; the radio stays off entirely
   }
 
+  // Bonds for this mode into the live store, previous mode's parked —
+  // strictly before init(), which is when the host stack first reads it.
+  bleBankSwitch(mode);
+
   // The GAP device name. Deliberately modeBleName() and not
   // modeProductName(): NimBLE caps this at 31 bytes and silently refuses
   // anything longer, which the USB product strings exceed. See mode.h.
   NimBLEDevice::init(modeBleName(mode));
+
+  // This mode's own identity address, so hosts see three separate
+  // devices (see the block comment above bleBankSwitch()). Order
+  // matters: setOwnAddr() installs the random address,
+  // setOwnAddrType() then validates that one is installed.
+  uint8_t identity[6];
+  bleIdentityFor(mode, identity);
+  NimBLEDevice::setOwnAddr(identity);
+  NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
 
   // Bonding, no MITM, secure connections: "just works" pairing, which is
   // the only kind available on a device with one button and (on one

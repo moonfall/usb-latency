@@ -904,3 +904,25 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `runAwaitSample` is what keeps that wait from swallowing a measurement
   belonging to some *manual* press made in the meantime: a run that ended
   normally already has its last sample, so it never waits at all.
+- **Each BLE mode is its own Bluetooth device, with its own banked bonds
+  — sharing one identity forced a forget-and-re-pair on every mode
+  switch.** Two mechanisms, both real, observed on hardware: hosts cache
+  the GATT database/HID report map *and* their pairing keys per device
+  address, so one address serving three different report maps breaks the
+  host's cache on every switch; and NimBLE's bond store
+  (`ble_store_nvs.c`, NVS namespace `nimble_bond`, blob-only) is keyed by
+  *peer*, so the same host pairing in a second mode overwrites the first
+  mode's keys device-side. Fix in `main.cpp`: `bleIdentityFor()` gives
+  each mode a static random address (BT MAC, mode index XORed into the
+  low byte, top two bits forced to 0b11 — and note NimBLE addresses are
+  little-endian, `out[5]` is the MSB); `bleBankSwitch()` swaps the whole
+  `nimble_bond` namespace against per-mode `bondbank_N` namespaces on
+  each BLE boot, before `NimBLEDevice::init()` reads the store. Owner
+  tracked in the `usbmode` prefs under `bondowner`. Bonds from
+  pre-banking firmware are wiped rather than adopted (they'd pair one
+  mode with keys the host now files under a different identity) — one
+  final re-pair per mode is the migration cost. A side benefit: the
+  pairing menu item's `deleteAllBonds()` now only clears the active
+  mode's bonds. Call-order trap: `setOwnAddr()` must precede
+  `setOwnAddrType(BLE_OWN_ADDR_RANDOM)` — the latter validates that a
+  random address is already installed.
