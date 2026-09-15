@@ -60,13 +60,13 @@
  * (see board.h for the full normal/menu button contract — this file just
  * implements it):
  *
- *      MENU                    MENU_TOP: four items, cycled by tap,
+ *      MENU                    MENU_TOP: five items, cycled by tap,
  *    > Light meter              triggered by a 1s+ hold. Light meter
  *      Auto test                flips meterView and exits; Auto test
- *      Change mode              hands off to main.cpp (which owns USB,
- *      Exit                     so it owns the presses) and exits;
- *   tap: next  hold: select     Change mode drops into the picker
- *                                below; Exit just leaves.
+ *      USB drive                hands off to main.cpp (which owns USB,
+ *      Change mode              so it owns the presses) and exits;
+ *      Exit                     USB drive and Change mode drop into the
+ *   tap: next  hold: select     two pickers below; Exit just leaves.
  *
  *   CHANGE MODE                MENU_MODE: tap advances the candidate via
  *     KEYBOARD                  appAdvancePendingMode() — the same NVS
@@ -75,9 +75,36 @@
  *                                the choice is already persisted per tap,
  *                                so there is nothing left to "confirm".
  *
+ *   USB DRIVE                  MENU_STORAGE: the same shape again, for
+ *     ARMED                     the one thing that is not a Mode you can
+ *   on next reset                cycle to — tap toggles whether the next
+ *   tap: toggle  hold: done      boot enumerates as a mass-storage device
+ *                                instead of a HID one (persisted per tap
+ *                                via appSetStorageArmed()), hold leaves.
+ *
  * While the menu is open, no press reaches the HID/measurement path at
  * all (see main.cpp) — every press is menu input until MENU_TOP's Exit,
- * or MENU_MODE's confirm, returns menuState to MENU_NONE.
+ * or a picker's confirm, returns menuState to MENU_NONE.
+ *
+ * A MODE_STORAGE boot leans on exactly that. It starts in MENU_DRIVE and
+ * never leaves, so boardMenuActive() is true from the first loop() pass
+ * onward and main.cpp's existing "the menu owns the button" branch does
+ * all the work: no HID report (there is no HID device that boot), no
+ * measurement started, no hold ladder, and no way to reach the automated
+ * test — with not one line of storage-awareness in main.cpp's press path.
+ * The screen is the whole UI for that boot:
+ *
+ *   USB DRIVE                  MENU_DRIVE: READY until the host ejects,
+ *     READY                     then EJECTED. The line under it says what
+ *   run files on host           a reset would do, so leaving is a hold
+ *   next reset: drive           (which toggles the armed flag, disarming
+ *   hold: toggle                 it) followed by a manual reset.
+ *
+ * And the rule that makes it safe: this file does NOT mount FFat in a
+ * MODE_STORAGE boot. The host has the volume; a second FatFs with its own
+ * cache on the same blocks would corrupt it, and neither side could tell.
+ * Run recording is inert that boot as a consequence — storageReady stays
+ * false — which costs nothing, because no run can be started anyway.
  *
  * Every automated run started from that menu is also written out, as one
  * CSV file per run on the board's `ffat` partition — see the run-storage
@@ -117,7 +144,9 @@
 #include <FFat.h>
 #include <M5GFX.h>
 #include <Preferences.h>
+#include <esp_partition.h>
 #include <esp_timer.h>
+#include <wear_levelling.h>
 
 #include "board.h"
 
@@ -161,10 +190,10 @@ static const uint32_t MEASURE_TIMEOUT_MS = 500;
 // --- Run storage -------------------------------------------------------
 // Finished automated runs are written to the `ffat` partition (see
 // partitions_atoms3r_8MB.csv) as one CSV file each. FAT rather than
-// LittleFS/SPIFFS on purpose: a follow-up exposes this partition raw
-// over USB MSC, so the host mounts the flash itself and reads the files
-// with no firmware in the loop — which only works if what's down there
-// really is a FAT volume. That also fixes the naming: 8.3, uppercase,
+// LittleFS/SPIFFS on purpose: USB drive mode (see the MSC block near the
+// bottom of this file) exposes this partition raw, so the host mounts the
+// flash itself and reads the files with no firmware in the loop — which
+// only works if what's down there really is a FAT volume. That also fixes the naming: 8.3, uppercase,
 // no long-filename entries.
 //
 // One file looks like this:
@@ -248,13 +277,23 @@ static volatile uint16_t autoTotal = 0;
 // like. menuState is volatile because boardMenuActive() (below) is
 // called from main.cpp on core 1; topIndex never is, so it doesn't need
 // to be.
-enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE };
+// MENU_DRIVE is the odd one out: it is not reached from MENU_TOP at all,
+// it is where a MODE_STORAGE boot starts and stays. Being a menu state is
+// the point — it makes boardMenuActive() true for that whole boot, which
+// is what keeps every press away from the HID/measurement path without
+// main.cpp knowing storage exists. See the file header.
+enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE };
 static volatile MenuState menuState = MENU_NONE;
 static int topIndex = 0;
-static const int NUM_TOP_ITEMS = 4;
+static const int NUM_TOP_ITEMS = 5;
 static const char *TOP_ITEM_LABELS[NUM_TOP_ITEMS] = {
-  "Light meter", "Auto test", "Change mode", "Exit"
+  "Light meter", "Auto test", "USB drive", "Change mode", "Exit"
 };
+
+// Set by boardShowStorageEjected() from the TinyUSB task, read by uiTask.
+// Only meaningful in a MODE_STORAGE boot, and only ever goes one way: the
+// host has flushed and let go, so the screen can say so.
+static volatile bool storageEjected = false;
 
 // Measurement results. Touched only by uiTask, so no synchronisation.
 // Kept as two separate populations, not pooled — see the file header on
@@ -503,6 +542,12 @@ static void drawNextLine(Mode active, Mode pending, HoldRung hint) {
     snprintf(buf, sizeof(buf), "AUTO %u/%u tap=stop",
              (unsigned)autoDone, (unsigned)autoTotal);
     color = riseColor();
+  } else if (appStorageArmed()) {
+    // Outranks a queued mode change because it is what the next reset
+    // will actually do: the drive boot ignores the HID mode entirely and
+    // comes back to it only once the drive is disarmed again.
+    snprintf(buf, sizeof(buf), "-> USB DRIVE");
+    color = display.color565(255, 190, 40);  // amber
   } else if (pending != active) {
     snprintf(buf, sizeof(buf), "-> %s", modeName(pending));
     color = display.color565(255, 190, 40);  // amber
@@ -609,8 +654,10 @@ static void drawMenuTop() {
   display.setTextColor(dim, black());
   display.drawString("MENU", SCREEN_W / 2, 6);
 
-  const int rowH = 16;
-  const int top = 28;
+  // Five items at the old 16px pitch would run into the hint lines at
+  // y=96, so the block is a little tighter and starts a little higher.
+  const int rowH = 14;
+  const int top = 22;
   char buf[24];
   for (int i = 0; i < NUM_TOP_ITEMS; i++) {
     bool selected = (i == topIndex);
@@ -655,6 +702,88 @@ static void drawMenuMode(Mode active, Mode pending) {
   display.drawString("hold: confirm", SCREEN_W / 2, 108);
 }
 
+// MENU_STORAGE: the arm/disarm picker, deliberately built to the same
+// pattern as drawMenuMode() above — a big candidate, "on next reset"
+// underneath it, and a tap that persists immediately so the hold has
+// nothing left to do but leave. Storage is not a Mode you can cycle to
+// (see mode.h on why MODE_STORAGE sits outside the rotation), so it needs
+// its own picker; making that picker look and behave identically is the
+// next best thing to it being one.
+static void drawMenuStorage(Mode pending) {
+  uint16_t dim = dimColor();
+  bool armed = appStorageArmed();
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  display.drawString("USB DRIVE", SCREEN_W / 2, 6);
+
+  display.setTextDatum(textdatum_t::middle_center);
+  display.setFont(&fonts::Font4);
+  display.setTextColor(armed ? display.color565(255, 190, 40) : dim, black());
+  display.drawString(armed ? "ARMED" : "OFF", SCREEN_W / 2, 52);
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  if (armed) {
+    display.drawString("on next reset", SCREEN_W / 2, 76);
+  } else {
+    // Say what it falls back to, so the two lines answer the same
+    // question ("what will the next reset be?") either way round.
+    char buf[24];
+    snprintf(buf, sizeof(buf), "stays %s", modeName(pending));
+    display.drawString(buf, SCREEN_W / 2, 76);
+  }
+  display.drawString("tap: toggle", SCREEN_W / 2, 96);
+  display.drawString("hold: done", SCREEN_W / 2, 108);
+}
+
+// MENU_DRIVE: the entire UI of a MODE_STORAGE boot. No items, no way out
+// except a hold and a manual reset — which is the honest shape of it,
+// since the USB descriptor is fixed for the boot (see main.cpp) and
+// nothing on this screen can change what the host is currently mounting.
+// The bottom line is therefore the important one: it always states what
+// the next reset will do, so "how do I get my gamepad back" is answered
+// on screen rather than remembered.
+static void drawMenuDrive(Mode pending) {
+  uint16_t dim = dimColor();
+  uint16_t amber = display.color565(255, 190, 40);
+  bool ejected = storageEjected;
+  bool armed = appStorageArmed();
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  display.drawString("USB DRIVE", SCREEN_W / 2, 6);
+
+  display.setTextDatum(textdatum_t::middle_center);
+  display.setFont(&fonts::Font4);
+  const char *headline = ejected ? "EJECTED" : "READY";
+  if (display.textWidth(headline) > SCREEN_W - 8) display.setFont(&fonts::Font2);
+  display.setTextColor(ejected ? amber : riseColor(), black());
+  display.drawString(headline, SCREEN_W / 2, 48);
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  display.drawString(ejected ? "safe to unplug" : "run files on host",
+                     SCREEN_W / 2, 70);
+
+  char buf[28];
+  if (armed) {
+    snprintf(buf, sizeof(buf), "next reset: drive");
+    display.setTextColor(dim, black());
+  } else {
+    snprintf(buf, sizeof(buf), "next reset: %s", modeName(pending));
+    display.setTextColor(amber, black());
+  }
+  display.drawString(buf, SCREEN_W / 2, 90);
+
+  display.setTextColor(dim, black());
+  display.drawString("hold: toggle", SCREEN_W / 2, 106);
+}
+
 static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung hint) {
   display.startWrite();
   display.fillScreen(black());
@@ -663,6 +792,10 @@ static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung 
     drawMenuTop();
   } else if (menuState == MENU_MODE) {
     drawMenuMode(active, pending);
+  } else if (menuState == MENU_STORAGE) {
+    drawMenuStorage(pending);
+  } else if (menuState == MENU_DRIVE) {
+    drawMenuDrive(pending);
   } else {
     drawTopStrip(raw, mv);
     drawModeLine(active);
@@ -696,7 +829,16 @@ static void uiTaskFn(void *) {
   // boot after that mounts in milliseconds. Note the consequence for that
   // first boot only: the screen stays black for however long the format
   // takes, because this task is the one that draws.
-  storageReady = FFat.begin(true);
+  //
+  // Skipped outright in a MODE_STORAGE boot, and this is the single most
+  // important line in that feature: the host is about to mount these very
+  // blocks. A FatFs instance here would keep its own cache of a volume
+  // the host is also writing, and the two would diverge silently until
+  // the directory table stopped making sense. So the firmware simply does
+  // not have a filesystem that boot — boardStorageBegin() took the
+  // partition raw instead, back in setup(), and nothing here needs one:
+  // no run can be started from a screen with no menu items on it.
+  if (wantActive != MODE_STORAGE) storageReady = FFat.begin(true);
 
   // What the screen currently shows, so only real changes are repainted.
   Mode shownActive = MODE_COUNT;  // MODE_COUNT != any real mode, forcing
@@ -708,6 +850,11 @@ static void uiTaskFn(void *) {
   uint16_t shownAutoDone = 0xFFFF;      // != any real count, same trick again
   uint16_t shownAutoTotal = 0xFFFF;
   int shownRaw = -1;
+  // The two storage screens draw from state that isn't menuState or
+  // topIndex, so they need their own "what's on the panel" mirrors or a
+  // toggle would never repaint.
+  bool shownArmed = false;
+  bool shownEjected = false;
 
   int raw = 0;
   uint32_t mv = 0;
@@ -745,7 +892,14 @@ static void uiTaskFn(void *) {
         topIndex = (topIndex + 1) % NUM_TOP_ITEMS;
       } else if (menuState == MENU_MODE) {
         appAdvancePendingMode();
+      } else if (menuState == MENU_STORAGE) {
+        // Persisted on the spot, exactly like the mode picker's tap —
+        // so the hold that follows is only ever "I'm done looking".
+        appSetStorageArmed(!appStorageArmed());
       }
+      // MENU_DRIVE deliberately ignores taps: a stray brush of the screen
+      // face while the host is copying files must not change what the
+      // next reset does. Only the 1s hold below counts there.
     }
     if (menuSelectRequested) {
       menuSelectRequested = false;
@@ -756,20 +910,31 @@ static void uiTaskFn(void *) {
           // goes; main.cpp waits for the button to come up before its
           // first press, so this hold can't leak into the data.
           case 1: appStartAutoTest(); menuState = MENU_NONE; break;      // Auto test
-          case 2: menuState = MENU_MODE; break;                          // Change mode
-          case 3: menuState = MENU_NONE; break;                          // Exit
+          case 2: menuState = MENU_STORAGE; break;                       // USB drive
+          case 3: menuState = MENU_MODE; break;                          // Change mode
+          case 4: menuState = MENU_NONE; break;                          // Exit
         }
-      } else if (menuState == MENU_MODE) {
-        // pendingMode is already persisted per tap — nothing to do here
-        // but leave.
+      } else if (menuState == MENU_MODE || menuState == MENU_STORAGE) {
+        // Both pickers persist per tap — nothing to do here but leave.
         menuState = MENU_NONE;
+      } else if (menuState == MENU_DRIVE) {
+        // The only gesture a storage boot has. It cannot change what the
+        // host is mounting right now — the USB descriptor was fixed
+        // before enumeration — so all it does is decide what the next
+        // manual reset comes up as. Toggling rather than only disarming
+        // means an accidental hold is undoable with another one.
+        appSetStorageArmed(!appStorageArmed());
       }
     }
 
     bool inMenu = (menuState != MENU_NONE);
+    bool storageScreen = (menuState == MENU_STORAGE || menuState == MENU_DRIVE);
+    bool armed = storageScreen && appStorageArmed();
+    bool ejected = storageEjected;
     bool newFrame = (active != shownActive || pending != shownPending ||
                      meterView != shownMeter ||
-                     menuState != shownMenuState || topIndex != shownTopIndex);
+                     menuState != shownMenuState || topIndex != shownTopIndex ||
+                     armed != shownArmed || ejected != shownEjected);
     // A clear only shows up in the measure view's top strip; the meter
     // view is live anyway and will repaint on its own cadence. The
     // histogram is visible in both views, so it always needs redrawing.
@@ -813,6 +978,8 @@ static void uiTaskFn(void *) {
         shownHint = hint;
         shownMenuState = menuState;
         shownTopIndex = topIndex;
+        shownArmed = armed;
+        shownEjected = ejected;
         shownAutoDone = autoDone;
         shownAutoTotal = autoTotal;
         shownRaw = raw;
@@ -973,6 +1140,107 @@ void boardWriteRun(const RunRecord &run) {
   f.close();
 }
 
+// --- USB mass storage: the ffat partition as raw blocks ----------------
+// A MODE_STORAGE boot hands this partition to the host instead of
+// mounting it (see the file header, and boardStorageBegin() for the
+// mutual exclusion). The mapping is not an approximation of what FatFs
+// does on top of wear levelling — it is deliberately the same arithmetic,
+// copied from ESP-IDF's own fatfs/diskio/diskio_wl.c:
+//
+//   sector count  wl_size(h) / wl_sector_size(h)
+//   sector N      lives at byte N * wl_sector_size(h)
+//   writing one   wl_erase_range() that sector, then wl_write() it whole
+//
+// so a block the host reads as LBA N is byte-for-byte the sector FatFs
+// wrote as sector N. Using wl_sector_size() as the USB block size rather
+// than the conventional 512 is what buys that: the FAT volume down there
+// was formatted with 4096-byte logical sectors (CONFIG_WL_SECTOR_SIZE),
+// and a 512-byte block size would leave the host's FAT driver reconciling
+// a 4096-byte BPB against 512-byte blocks for no gain.
+static wl_handle_t wlHandle = WL_INVALID_HANDLE;
+static size_t wlSector = 0;   // bytes per wear-levelling sector == USB block
+static uint32_t wlBlocks = 0;
+// One sector, staged. wl_write() needs its sector erased first, so a
+// partial-block write cannot be passed straight through — it would have
+// to erase what the earlier fragments just wrote. Chunks are accumulated
+// here and committed only once a whole sector is present. With this
+// core's CFG_TUD_MSC_EP_BUFSIZE (4096) equal to the block size the host
+// always fills it in one call, but the SCSI contract permits fragments
+// and correctness here is not worth gambling on a build-time constant.
+static uint8_t *wlStage = nullptr;
+
+bool boardHasStorage() {
+  return true;
+}
+
+bool boardStorageBegin(uint32_t *blockCount, uint16_t *blockSize) {
+  const esp_partition_t *part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, "ffat");
+  if (!part) return false;
+
+  // Note what is NOT happening anywhere near here: FFat.begin(). This is
+  // the only claim on the partition for the whole boot — uiTaskFn checks
+  // the mode and skips its mount — because two writers on one FAT volume
+  // is data loss with no symptom until it is far too late.
+  if (wl_mount(part, &wlHandle) != ESP_OK) {
+    wlHandle = WL_INVALID_HANDLE;
+    return false;
+  }
+
+  wlSector = wl_sector_size(wlHandle);
+  // USB block size is a uint16_t on the wire, so an oversized sector is a
+  // configuration this code cannot express — better to say so and let
+  // main.cpp fall back to a HID boot than to enumerate a broken drive.
+  if (wlSector == 0 || wlSector > UINT16_MAX) {
+    wl_unmount(wlHandle);
+    wlHandle = WL_INVALID_HANDLE;
+    return false;
+  }
+
+  wlStage = (uint8_t *)malloc(wlSector);
+  if (!wlStage) {
+    wl_unmount(wlHandle);
+    wlHandle = WL_INVALID_HANDLE;
+    return false;
+  }
+
+  wlBlocks = (uint32_t)(wl_size(wlHandle) / wlSector);
+  *blockCount = wlBlocks;
+  *blockSize = (uint16_t)wlSector;
+  return wlBlocks > 0;
+}
+
+int32_t boardStorageRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t size) {
+  if (wlHandle == WL_INVALID_HANDLE) return -1;
+  // Out of range is an error, not a short read: returning 0 would tell
+  // TinyUSB "not ready, ask again" and spin the host forever.
+  if (lba >= wlBlocks || offset > wlSector || size > wlSector - offset) return -1;
+  if (wl_read(wlHandle, (size_t)lba * wlSector + offset, buffer, size) != ESP_OK) return -1;
+  return (int32_t)size;
+}
+
+int32_t boardStorageWrite(uint32_t lba, uint32_t offset, const uint8_t *buffer, uint32_t size) {
+  if (wlHandle == WL_INVALID_HANDLE || !wlStage) return -1;
+  if (lba >= wlBlocks || offset > wlSector || size > wlSector - offset) return -1;
+
+  memcpy(wlStage + offset, buffer, size);
+  // Still short of a whole sector: report the bytes taken and wait for
+  // the rest of the block before touching flash at all.
+  if (offset + size < wlSector) return (int32_t)size;
+
+  size_t addr = (size_t)lba * wlSector;
+  if (wl_erase_range(wlHandle, addr, wlSector) != ESP_OK) return -1;
+  if (wl_write(wlHandle, addr, wlStage, wlSector) != ESP_OK) return -1;
+  return (int32_t)size;
+}
+
+void boardShowStorageEjected() {
+  // Runs on the TinyUSB task, so it does what every other cross-core
+  // entry point here does and no more: one store and a poke.
+  storageEjected = true;
+  nudgeUi();
+}
+
 bool boardMenuActive() {
   return menuState != MENU_NONE;
 }
@@ -999,6 +1267,12 @@ bool boardButtonPressed() {
 void boardShowBoot(Mode active, Mode pending) {
   wantActive = active;
   wantPending = pending;
+  // Set here, on core 1, rather than left for the task to notice: main.cpp
+  // starts calling boardMenuActive() on its very first loop() pass, which
+  // can beat a freshly created task to its first iteration. A storage boot
+  // that lost that race would route its first press into the HID path —
+  // where there is no HID device to send on.
+  if (active == MODE_STORAGE) menuState = MENU_DRIVE;
   // Core 0: loop() has core 1 (ARDUINO_RUNNING_CORE=1) to itself. Priority
   // 1 matches the Arduino loop task and stays below the USB task, so
   // neither the HID path nor enumeration can be held up by a repaint or

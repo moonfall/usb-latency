@@ -1,5 +1,5 @@
 /*
- * USB HID Gamepad / Keyboard / Mouse (single active device)
+ * USB HID Gamepad / Keyboard / Mouse (single active device), or a drive
  * -------------------------------------------------------------------------
  * Emulates exactly ONE USB HID device at a time — gamepad ("X" button),
  * keyboard (Space), or mouse (left click) — selected by the board's one
@@ -19,12 +19,13 @@
  *       mode picker, advance the candidate mode.
  *     - Hold 1s: trigger the highlighted item's action.
  *   The menu holds the light meter (a live view, toggled instantly),
- *   the automated test (see appStartAutoTest()) and changing the pending
- *   mode (see appAdvancePendingMode()). The first and last used to be
- *   hold-ladder rungs of their own; moving them into a proper menu is
- *   what let short-press-to-advance and hold-to-select behave the same
- *   way at every level, instead of every feature inventing its own hold
- *   duration to remember — and left somewhere obvious to put the third.
+ *   the automated test (see appStartAutoTest()), arming the USB drive
+ *   (see appSetStorageArmed()) and changing the pending mode (see
+ *   appAdvancePendingMode()). The first and last used to be hold-ladder
+ *   rungs of their own; moving them into a proper menu is what let
+ *   short-press-to-advance and hold-to-select behave the same way at
+ *   every level, instead of every feature inventing its own hold
+ *   duration to remember — and left somewhere obvious to put the rest.
  *
  *   While an automated run is going, the button does one thing only:
  *   stop it. Nothing else — no HID report, no hold rungs — because the
@@ -50,6 +51,24 @@
  * the sensor: press the button, watch the thing you're pointing at
  * change, and watch the bar move. Inside the menu, no press sends HID at
  * all — see above.)
+ *
+ *   The USB drive (MODE_STORAGE) is the opposite call, and worth
+ *   contrasting with the meter for that reason. It IS a Mode: it changes
+ *   what the device enumerates as, it needs the descriptor decided before
+ *   USB.begin(), and so it cannot be entered or left without a reboot —
+ *   every cost the meter was moved out of Mode-hood to avoid, this one
+ *   genuinely incurs. On a board that has a filesystem partition, arming
+ *   it (menu -> USB drive) makes the NEXT boot come up as a small
+ *   mass-storage device whose blocks are the `ffat` partition itself, so
+ *   the host mounts the run CSVs with no firmware in the loop. That boot
+ *   has no HID device at all — a press sends nothing, which sendPress()
+ *   already gets right for free via its `default:` arm — and, critically,
+ *   the firmware does not mount FFat on that partition while the host has
+ *   it (two writers on one FAT volume is silent corruption). It stays a
+ *   drive across replugs until disarmed from the drive screen: a hold,
+ *   then a manual reset. MODE_STORAGE deliberately sits outside the
+ *   `% MODE_COUNT` rotation so no amount of holding can reach it — see
+ *   mode.h.
  *
  * Two boards are supported, one PlatformIO env each. Everything specific
  * to a board — which pin the button is on, and how state is shown — lives
@@ -120,6 +139,7 @@
 #include <USBHIDGamepad.h>
 #include <USBHIDKeyboard.h>
 #include <USBHIDMouse.h>
+#include <USBMSC.h>
 
 #include "board.h"
 #include "mode.h"
@@ -161,10 +181,22 @@ static const uint32_t AUTO_HOLD_MAX_MS = 1000;
 
 static const char *PREFS_NAMESPACE = "usbmode";
 static const char *PREFS_KEY = "mode";
+// Whether the next boot should come up as a USB drive instead of a HID
+// device. A key of its own rather than a fourth value in PREFS_KEY: the
+// HID mode has to go on being remembered while storage is armed, or
+// leaving storage mode would have nowhere to return to. Two values were
+// needed either way, so they are two keys.
+static const char *PREFS_STORAGE_KEY = "storage";
 
 static Preferences prefs;
 static Mode activeMode = MODE_GAMEPAD;   // mode this boot actually enumerated as
 static Mode pendingMode = MODE_GAMEPAD;  // mode a reboot would pick up; dialed in by holding
+// Sticky, not one-shot: a drive that reverted to a gamepad on every
+// replug would be useless for the one thing it exists for — carrying run
+// files to whichever machine you want to read them on. It stays a drive
+// until someone says otherwise, and saying otherwise is one hold on the
+// screen (see MENU_DRIVE in board_atoms3r.cpp).
+static bool storageArmed = false;
 
 // Manual CDC serial (see file header on why ARDUINO_USB_CDC_ON_BOOT is 0).
 static USBCDC USBSerial;
@@ -174,6 +206,12 @@ static USBCDC USBSerial;
 static USBHIDGamepad *gamepad = nullptr;
 static USBHIDKeyboard *keyboard = nullptr;
 static USBHIDMouse *mouse = nullptr;
+// ...and the fourth identity, which is not a HID device at all. Same
+// rule, same reason: USBMSC's constructor registers the mass-storage
+// interface with TinyUSB the moment it runs, exactly as the HID classes
+// register their report descriptors, so it may only be constructed on a
+// boot that means to be a drive.
+static USBMSC *msc = nullptr;
 
 static bool stableState = false;   // false = released, true = pressed
 static uint32_t lastTriggerMs = 0;   // also this press's start time, while held
@@ -288,6 +326,49 @@ static void advancePendingMode() {
 // "first of hold" to report.
 void appAdvancePendingMode() {
   doAdvancePendingMode(false);
+}
+
+// The storage flag's two accessors, called by the board's USB-drive
+// picker and by the drive screen's disarm hold. They live here for the
+// same reason the mode ones do: this file owns the "usbmode" namespace
+// and the question of what a reboot will come up as. Note what they do
+// NOT do — nothing about this boot changes, no device is created or torn
+// down, and nothing reboots. Arming a drive is exactly as inert as
+// queueing a mode change, and for exactly the same reason (see the file
+// header on why the reboot has to be the user's).
+void appSetStorageArmed(bool armed) {
+  if (!boardHasStorage()) return;  // nothing to expose; refuse to remember one
+  storageArmed = armed;
+  prefs.putBool(PREFS_STORAGE_KEY, armed);
+}
+
+bool appStorageArmed() {
+  return storageArmed;
+}
+
+// --- USB mass storage callbacks ---------------------------------------
+// TinyUSB wants plain function pointers, and everything they need is the
+// board's (which partition, which blocks) — so these are three-line
+// trampolines and the real work is behind board.h. They run on the
+// TinyUSB task, never from loop().
+static int32_t mscRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t bufsize) {
+  return boardStorageRead(lba, offset, buffer, bufsize);
+}
+
+static int32_t mscWrite(uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize) {
+  return boardStorageWrite(lba, offset, buffer, bufsize);
+}
+
+static bool mscStartStop(uint8_t power_condition, bool start, bool load_eject) {
+  (void)power_condition;
+  // The host finished with the volume: caches flushed, nothing more
+  // coming. Dropping mediaPresent stops it polling a disk it has already
+  // let go of, and the screen gets to say "safe to unplug" — which is
+  // the only honest moment to say it, since a drive boot is left by
+  // pulling the plug or pressing reset.
+  if (load_eject && !start && msc) msc->mediaPresent(false);
+  if (load_eject && !start) boardShowStorageEjected();
+  return true;
 }
 
 // The board's half of one sample, arriving from its measurement code on
@@ -480,16 +561,57 @@ void setup() {
   boardBegin();
 
   prefs.begin(PREFS_NAMESPACE, false);
+  // `stored < MODE_COUNT` is the validation, and it keeps working
+  // unchanged now that MODE_STORAGE exists — precisely because this key
+  // only ever holds one of the three HID identities. Storage lives in its
+  // own key, so a stored value of MODE_STORAGE here would still be
+  // rejected as the corruption it would be.
   uint8_t stored = prefs.getUChar(PREFS_KEY, MODE_GAMEPAD);
   activeMode = (stored < MODE_COUNT) ? static_cast<Mode>(stored) : MODE_GAMEPAD;
   pendingMode = activeMode;
+  // Gated on the board, not just on the flag: a board with no partition
+  // to expose must never boot into a drive, whatever its NVS says — and
+  // on such a board this is a compile-time false, since exactly one
+  // board_*.cpp is linked.
+  storageArmed = boardHasStorage() && prefs.getBool(PREFS_STORAGE_KEY, false);
 
   // Construct the one active-mode device, and set the product name to
   // match, before USB.begin() — both are rejected as no-ops afterwards.
+  //
+  // Storage first, because it is the identity that replaces the other
+  // three rather than joining them. activeMode is only moved to
+  // MODE_STORAGE once the partition is actually in hand: if the mount
+  // fails there is nothing to expose, and coming up as the HID mode that
+  // is still sitting in NVS beats enumerating a drive with no blocks
+  // behind it. pendingMode is left pointing at that HID mode either way —
+  // it is what the screen offers as the way back out.
+  if (storageArmed) {
+    uint32_t blockCount = 0;
+    uint16_t blockSize = 0;
+    if (boardStorageBegin(&blockCount, &blockSize)) {
+      activeMode = MODE_STORAGE;
+      msc = new USBMSC();
+      msc->vendorID("USBLAT");
+      msc->productID("Latency Runs");
+      msc->productRevision("1.0");
+      msc->onRead(mscRead);
+      msc->onWrite(mscWrite);
+      msc->onStartStop(mscStartStop);
+      msc->mediaPresent(true);
+      // Callbacks before begin(): begin() refuses if either is still
+      // unset, and returns false rather than saying why.
+      msc->begin(blockCount, blockSize);
+    }
+  }
+
   switch (activeMode) {
     case MODE_GAMEPAD:  gamepad = new USBHIDGamepad();  gamepad->begin();  break;
     case MODE_KEYBOARD: keyboard = new USBHIDKeyboard(); keyboard->begin(); break;
     case MODE_MOUSE:    mouse = new USBHIDMouse();      mouse->begin();    break;
+    // MODE_STORAGE lands here, and landing here is the entire point: no
+    // HID device is constructed, so nothing contributes a report
+    // descriptor and the device enumerates as a plain mass-storage
+    // gadget. Same `default:` arm that makes sendPress() send nothing.
     default: break;
   }
   USB.productName(modeProductName(activeMode));

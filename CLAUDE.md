@@ -2,7 +2,9 @@
 
 PlatformIO firmware for measuring/minimizing input-to-USB latency: a board
 with one button emulates a USB HID gamepad, keyboard, or mouse, and a press
-is turned into a HID report as directly as possible.
+is turned into a HID report as directly as possible. On the AtomS3R it can
+also boot as a USB drive instead, handing the host the flash partition the
+recorded runs live on.
 
 Two boards are supported, one PlatformIO env each, from one shared source
 tree:
@@ -27,22 +29,25 @@ a menu (AtomS3R only) is open:
 | normal | hold 1s | reset the measurement statistics | yes |
 | normal | hold 2s | open the menu (below) | yes |
 | normal | hold 3s, repeating | advance the *pending* mode (reboot to apply) | no (S3-Zero only) |
-| menu | tap | advance — move the selection, or the mode-picker's candidate | yes |
+| menu | tap | advance — move the selection, or a picker's candidate | yes |
 | menu | hold 1s | trigger the highlighted item | yes |
 | auto test running | press | stop the run (and nothing else) | yes |
+| storage boot | hold 1s | toggle whether the *next* reset is a drive | AtomS3R only |
 
 The S3-Zero has no screen and so no menu — its button is exactly what it
 always was: press sends the action, holding cycles the pending mode every
 3s. On the AtomS3R, a 2s hold from normal operation opens a small menu
-(`Light meter`, `Auto test`, `Change mode`, `Exit`) that owns every subsequent press
-until it exits: tap cycles the highlighted item, a 1s+ hold triggers it.
-`Change mode` drops into a picker where tap advances the candidate mode
-(persisting it immediately, same NVS write the S3-Zero's hold-to-cycle
-gesture always did) and hold confirms by just leaving. `Light meter`
-toggles instantly and exits; `Exit` just exits. No press reaches the
-HID/measurement path while the menu is open — see `wasMenuActiveAtPress`
-in `main.cpp` for how that's decided once per press rather than
-re-checked live.
+(`Light meter`, `Auto test`, `USB drive`, `Change mode`, `Exit`) that owns
+every subsequent press until it exits: tap cycles the highlighted item, a
+1s+ hold triggers it. `Change mode` drops into a picker where tap advances
+the candidate mode (persisting it immediately, same NVS write the
+S3-Zero's hold-to-cycle gesture always did) and hold confirms by just
+leaving. `USB drive` drops into an identical-looking picker where tap
+toggles `ARMED`/`OFF` and hold leaves — see USB drive mode below.
+`Light meter` toggles instantly and exits; `Exit` just exits. No press
+reaches the HID/measurement path while the menu is open — see
+`wasMenuActiveAtPress` in `main.cpp` for how that's decided once per press
+rather than re-checked live.
 
 `Auto test` runs `AUTO_TEST_ITERATIONS` (500) presses in the current mode
 unattended, spaced by a random 200-500ms gap — roughly three to five
@@ -60,6 +65,24 @@ kept in NVS. Aborted runs are written too, with whatever they collected.
 Nothing is written while a run is in progress — see the
 no-flash-writes-during-a-run gotcha below, and the run-storage block in
 `board_atoms3r.cpp` for the file format.
+
+**USB drive mode** (AtomS3R only) is how those files get off the device:
+the menu's `USB drive` item arms a flag in NVS, and the *next* boot
+enumerates as a small mass-storage device — product name "USB Latency
+Tester - Storage" — whose blocks are the `ffat` partition itself, so the
+host mounts the run CSVs with no firmware in the loop. As with a pending
+mode change, arming does nothing this session and the firmware never
+reboots itself; a manual reset (or replug) applies it.
+
+A drive boot has **no HID device at all** — a press sends nothing — and
+the firmware does not mount FFat on that partition while the host holds
+it (see the two-writers gotcha below). The screen still works, and is the
+whole UI for that boot: a `USB DRIVE` screen showing `READY`, or
+`EJECTED` once the host has let go (i.e. safe to unplug), with a line
+stating what the next reset will do. It is **sticky**, not one-shot — a
+drive that turned back into a gamepad on every replug would be useless
+for carrying files between machines — so leaving it is explicit: hold the
+screen for 1s to toggle the flag back off, then reset.
 
 ## Build
 
@@ -115,12 +138,22 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   debounce, to keep added latency at zero for the button action itself —
   only the mode-cycling feedback is deliberately slow. The HID report is
   always sent *before* any board feedback is drawn, so lighting an LED or
-  repainting a screen is never in the latency path.
+  repainting a screen is never in the latency path. A separate NVS key
+  (`usbmode`/`storage`, read only where `boardHasStorage()` is true)
+  selects the fourth identity instead: `MODE_STORAGE`, where a `USBMSC`
+  is constructed in place of any HID class and its read / write /
+  start-stop callbacks are one-line trampolines onto `boardStorage*()`.
+  The armed flag is a key of its own rather than a fourth value in
+  `mode`, because the HID identity has to go on being remembered while a
+  drive is armed — that's what the drive screen offers as the way back.
 - `src/mode.h` — the `Mode` enum plus the strings naming it (mode name,
   the action a press sends, the USB product string). Header-only lookup
   tables, shared by the core and the board layer. A `Mode` is a USB
   identity and nothing more, which is exactly why it is stuck until a
   reboot — see the light-meter-is-not-a-mode gotcha below.
+  `MODE_STORAGE` deliberately sits *past* `MODE_COUNT`, so the
+  `% MODE_COUNT` rotation can never reach it — see the
+  storage-is-a-mode-but-not-in-the-rotation gotcha below.
 - `src/board.h` — the board I/O contract: `boardBegin()`,
   `boardHasSensor()`, `boardButtonPressed()`, `boardShowBoot()`,
   `boardShowPress()`, `boardShowPending()`, `boardResetStats()`,
@@ -134,7 +167,12 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `boardWriteRun()` (`main.cpp` → board, the whole buffered run, once,
   after it ends). The split follows who knows what — `main.cpp` paces the
   run and so owns the mode, the iteration count and the gap before each
-  press; the board did the measuring and so owns the result. main.cpp owns the normal-operation
+  press; the board did the measuring and so owns the result. USB drive
+  mode splits the same way: `boardHasStorage()`, `boardStorageBegin()`,
+  `boardStorageRead()`, `boardStorageWrite()` and
+  `boardShowStorageEjected()` (the board owns the flash) against
+  `appSetStorageArmed()` / `appStorageArmed()` (`main.cpp` owns USB and
+  the `usbmode` NVS namespace). main.cpp owns the normal-operation
   ladder's timing and pushes the resulting hint down, so the board
   renders a label and never duplicates a threshold; it also decides, once
   per press edge via `boardMenuActive()`, whether that press is HID input
@@ -142,9 +180,11 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   are no board `#ifdef`s in `main.cpp` and nothing in the board layer
   touches USB. Mode state is passed in rather than duplicated there.
 - `src/board_s3zero.cpp` — ESP32-S3-Zero: BOOT button (GPIO0, active-low),
-  onboard WS2812 (GPIO21). No sensor, no menu, no filesystem, so the
-  measurement, menu and run-storage halves of the contract are all no-ops
-  here. The LED lights up while the button is held, in a
+  onboard WS2812 (GPIO21). No sensor, no menu, no filesystem and no data
+  partition at all, so the measurement, menu, run-storage and USB-drive
+  halves of the contract are all no-ops here — `boardHasStorage()`
+  returning false is what stops `main.cpp` even *reading* the armed flag
+  on this board, so it can never boot into a drive it has no blocks for. The LED lights up while the button is held, in a
   colour identifying the active mode (red/green/blue). Once a hold crosses
   `MODE_HOLD_MS`, it flashes white for `MODE_SWITCH_FLASH_MS` (500ms) to
   mark the first mode change in that hold, then shows the new pending
@@ -166,7 +206,13 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   samples of each direction sharing one time axis, with the axis's min
   and max labelled at its ends. A 2s hold replaces all of that with a
   small menu instead — see the menu bullet in the interaction table above
-  and the file header in `board_atoms3r.cpp` for the two screens it uses.
+  and the file header in `board_atoms3r.cpp` for the screens it uses. It
+  also owns the wear-levelling side of USB drive mode
+  (`wl_mount`/`wl_read`/`wl_erase_range`/`wl_write` on the `ffat`
+  partition) and the `USB DRIVE` screen a storage boot lives on — which
+  is a *menu state* (`MENU_DRIVE`) it starts in and never leaves, so
+  `boardMenuActive()` is true for that whole boot and `main.cpp` needs no
+  storage-awareness in its press path at all.
 
   **Nothing here draws from `loop()`.** All panel access and all ADC
   sampling happen in one task (`uiTaskFn`) pinned to core 0, while
@@ -469,13 +515,109 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `uiTaskFn`'s startup rather than lazily on first use: boot is the one
   moment when nothing is being timed.
 - **Storage is FFat (wear-levelled FAT), not LittleFS or SPIFFS, and that
-  choice is load-bearing.** A follow-up exposes the `ffat` partition raw
-  over USB MSC, so the host mounts the flash itself and reads run files
-  with no firmware in the loop — which only works if what's down there is
-  a genuine FAT volume. Consequences worth remembering: filenames are 8.3
+  choice is load-bearing.** USB drive mode exposes the `ffat` partition
+  raw over USB MSC, so the host mounts the flash itself and reads run
+  files with no firmware in the loop — which only works if what's down
+  there is a genuine FAT volume. Consequences worth remembering: filenames are 8.3
   and uppercase (`RUN00042.CSV` — a long name would cost VFAT entries and
   get mangled), and the run counter wraps at 99999 rather than growing a
   sixth digit.
+- **`USBMSC`'s constructor registers the mass-storage interface, exactly
+  like the HID classes register their report descriptors.** Same file,
+  same pattern (`USBMSC::USBMSC()` calls `tinyusb_enable_interface(
+  USB_INTERFACE_MSC, ...)` unconditionally), so the rule established for
+  HID extends verbatim: *only* construct the device class the boot means
+  to be. `msc` is a pointer `new`'d in `setup()` behind the armed-flag
+  check, never a global — a global would put a drive interface into every
+  gamepad's descriptor. The corollary is what keeps the S3-Zero clean:
+  its `boardHasStorage()` is false, so the `new USBMSC()` is never
+  reached and that env's descriptor is byte-for-byte what it was before
+  any of this existed, despite `USBMSC.h` being included unconditionally.
+- **Storage is a `Mode`, but it must not be in the mode rotation — hence
+  the gap after `MODE_COUNT`.** It genuinely is a fourth USB identity:
+  fixed at boot, decided before `USB.begin()`, with its own product
+  string. So it's a `Mode`, and that is what makes it free in the press
+  path — `sendPress()`/`sendRelease()` already end in `default: break;`,
+  which is precisely "this identity sends nothing", so no new branch goes
+  into the hot path and no null HID pointer can be dereferenced. But
+  `MODE_COUNT` stays at 3 and `MODE_STORAGE` sits *past* it, so
+  `(pendingMode + 1) % MODE_COUNT` structurally cannot produce it: you
+  cannot hold the button into a drive, and the S3-Zero cannot reach one
+  at all. Note `MODE_COUNT` doubles as `board_atoms3r.cpp`'s "nothing
+  drawn yet" sentinel, which is the other reason `MODE_STORAGE` could not
+  simply *be* `MODE_COUNT`. The persisted value is separate again
+  (`usbmode`/`storage`): the `mode` key must keep holding the HID
+  identity to come back to, so a fourth enum value in it would have had
+  nowhere to remember that.
+- **Storage mode needs no special case in `main.cpp`'s loop, because it
+  reuses "the menu owns the button".** A drive boot starts in a menu
+  state (`MENU_DRIVE`) and never leaves it, so `boardMenuActive()` is
+  true from the first `loop()` pass onward and the existing branch
+  already does everything wanted: no HID report, no measurement started,
+  no hold ladder, and the automated test unreachable (its menu item
+  cannot be highlighted on a screen with no items). Getting there needed
+  one ordering detail: `menuState` is set synchronously in
+  `boardShowBoot()` on core 1, *not* left for `uiTaskFn` to notice —
+  `main.cpp` starts calling `boardMenuActive()` on its first loop pass,
+  which can beat a freshly created task to its first iteration, and a
+  drive boot that lost that race would route its first press at a HID
+  device that does not exist.
+- **The firmware must not have FFat mounted on `ffat` while MSC is
+  exposing it.** Two FAT drivers on one volume — the host's, with its own
+  block cache, and FatFs's — diverge silently and end with a directory
+  table that makes sense to neither. So `uiTaskFn` skips `FFat.begin()`
+  entirely when `wantActive == MODE_STORAGE`, which is why run recording
+  is inert that boot (`storageReady` stays false). Nothing is lost by it:
+  no run can be started from a screen with no menu items. The inverse
+  holds too — `boardStorageBegin()`'s `wl_mount()` is the *only* claim on
+  the partition in a drive boot.
+- **MSC block size is `wl_sector_size()` (4096 here), not the customary
+  512.** The FAT volume on `ffat` was formatted by FatFs on top of wear
+  levelling with 4096-byte logical sectors (`CONFIG_WL_SECTOR_SIZE`, and
+  the S3 sdkconfig picks 4096), so its BPB says 4096. Exposing 512-byte
+  USB blocks would leave every host's FAT driver reconciling a 4096-byte
+  BPB against 512-byte blocks for no benefit, and would make the
+  LBA↔offset arithmetic stop matching FatFs's. Matching instead means the
+  MSC glue is literally ESP-IDF's `fatfs/diskio/diskio_wl.c`: block count
+  is `wl_size(h) / wl_sector_size(h)`, block N lives at
+  `N * wl_sector_size(h)`, and writing one is `wl_erase_range()` that
+  sector then `wl_write()` it whole. Unverified on hardware — a host that
+  refuses 4096-byte USB blocks would be the first thing to check if the
+  drive enumerates but won't mount.
+- **`wl_write()` will not write a partial sector — it needs the sector
+  erased first.** So the MSC write callback cannot pass its buffer
+  straight through: erasing to write a fragment would destroy the
+  fragments already staged for that block. Chunks are accumulated in a
+  one-sector RAM buffer and committed only when a whole sector is
+  present. In this core `CFG_TUD_MSC_EP_BUFSIZE` is 4096, equal to the
+  block size, so the host always fills it in one call and the staging is
+  a no-op — but that's a build-time constant in somebody else's package,
+  not a contract, and the SCSI callback signature has an `offset`
+  parameter precisely because fragments are legal.
+- **Blocking on flash inside the MSC callbacks is fine, and it is the one
+  place in this firmware where that's true.** They run on the TinyUSB
+  task and an erase stalls the cache on both cores — the exact hazard the
+  no-flash-writes-during-a-run gotcha exists for. It doesn't bite here
+  because a drive boot measures nothing: no HID device, no sensor poll,
+  no run. If measurement ever became reachable from a storage boot, this
+  would immediately become a real problem.
+- **Leaving USB drive mode is a hold plus a *manual* reset, and the
+  no-automatic-reboot rule is why.** The drive screen's 1s hold only
+  toggles the armed flag; it cannot change what the host is mounting
+  right now (the descriptor was fixed before enumeration) and it
+  deliberately does not call `ESP.restart()` — see the
+  mode-switching-must-not-reboot gotcha above, which this follows rather
+  than re-litigates. Taps on that screen are ignored outright: the whole
+  LCD face is the button, and a stray brush while the host is copying
+  files must not change what the next reset does. Storage is sticky
+  rather than one-shot on the same reasoning that made it a `Mode` — a
+  drive that turned back into a gamepad on every replug is useless for
+  carrying files between machines.
+- **The AtomS3R top menu is five items now, and the row pitch had to
+  shrink for them to fit.** At the original 16px pitch from y=28 the
+  fifth row would land on the "tap: next" hint at y=96; it's 14px from
+  y=22 instead. The 128x128 panel has room for one more item after that
+  and no more — anything further needs a scrolling menu, not another row.
 - **Don't move or resize the `nvs` partition.** `partitions_atoms3r_8MB.csv`
   keeps it at `0x9000`, size `0x5000`, identical to the stock
   `default_8MB.csv` the AtomS3 board profile ships. That's what lets an
@@ -490,7 +632,13 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   time has whatever the old SPIFFS partition left behind at `0x410000`,
   which will not mount as FAT. The format runs inside `uiTaskFn`, and that
   task is also the one that draws, so the very first boot after reflashing
-  shows nothing until it finishes. One-off, not a hang.
+  shows nothing until it finishes. One-off, not a hang. Note this is the
+  only thing that ever formats the volume, and a drive boot skips it (see
+  the two-writers gotcha above) — which is fine only because arming a
+  drive requires reaching the menu on an ordinary boot first, so the
+  format has always already happened by then. A device that could somehow
+  come up as a drive on its very first boot would hand the host an
+  unformatted volume.
 - **`appRecordSample()` must be called before the board drops
   `measureBusy`, not after.** It's the same handover as `pressMicros` in
   the other direction: the automated test on core 1 waits for

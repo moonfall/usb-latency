@@ -57,6 +57,15 @@ void boardShowHoldHint(HoldRung next);
 // True while the menu owns the button. A board without a sensor has no
 // menu to open and always returns false, so main.cpp's normal path runs
 // unconditionally there, exactly as before this existed.
+//
+// A MODE_STORAGE boot is the other extreme: it returns true from the
+// first loop() pass and never goes back, because the drive screen is the
+// only screen that boot has. That one answer is what makes storage mode
+// need no special case in main.cpp's press path at all — every press is
+// already routed to boardMenuTap()/boardMenuSelect() instead of to HID
+// and the measurement, the hold ladder is already skipped, and the
+// automated test is already unreachable (its menu item cannot be
+// highlighted from a screen that has no items).
 bool boardMenuActive();
 
 // Fired once, when a hold crosses the "open the menu" threshold during
@@ -138,9 +147,10 @@ void appStartAutoTest();
 // --- Recording an automated run ----------------------------------------
 // Every automated run is written out as a CSV file on the board's flash
 // filesystem, so a distribution can be looked at properly afterwards
-// instead of being read off a 128x128 screen while it happens. (A
-// follow-up exposes that filesystem over USB MSC; the on-flash format is
-// chosen with that in mind — see board_atoms3r.cpp.)
+// instead of being read off a 128x128 screen while it happens. (The same
+// partition is what a MODE_STORAGE boot hands to the host raw — see the
+// USB mass storage block below — which is why the on-flash format is
+// plain FAT with 8.3 names; see board_atoms3r.cpp.)
 //
 // The two halves of a sample are known by different owners, which is the
 // whole reason this needs a contract rather than one file doing it all:
@@ -184,6 +194,72 @@ struct RunRecord {
 // A board with no filesystem — and, having no sensor, no way to have
 // produced a sample in the first place — does nothing here.
 void boardWriteRun(const RunRecord &run);
+
+// --- USB mass storage --------------------------------------------------
+// A fourth USB identity (MODE_STORAGE), on boards that have a filesystem
+// partition worth exposing: instead of a HID device, the board enumerates
+// as a small thumb drive whose blocks ARE the `ffat` partition, so the
+// host mounts the run CSVs directly with no firmware in the loop.
+//
+// The split of duties is the same one as everywhere else, just applied to
+// a new pair of things: only main.cpp may touch USB, so main.cpp
+// constructs USBMSC and owns its callbacks; only the board knows where
+// its flash is, so the board owns the partition and the block I/O. The
+// three functions below are the seam between them.
+//
+// The hard rule that makes any of it safe: in a MODE_STORAGE boot the
+// firmware must NOT also have FFat mounted on that partition. Two writers
+// on one FAT volume — the host's cached view and FatFs's — corrupt it,
+// and neither side has any way to notice. So the board skips its mount
+// entirely when it comes up in MODE_STORAGE, which also makes run
+// recording inert for that boot (nothing to write to, and nothing that
+// could start a run anyway — see boardMenuActive() below).
+
+// True if this board has a partition to expose. Gates everything else
+// here, including whether main.cpp consults the persisted armed flag at
+// all — a board with no storage partition must never boot into a mode it
+// cannot implement, however its NVS got written.
+bool boardHasStorage();
+
+// Prepare the partition for raw block access and report its geometry, in
+// the units USB mass storage speaks. Called from setup() on a
+// MODE_STORAGE boot only, BEFORE USB.begin(), and never on a boot where
+// the filesystem is mounted normally.
+//
+// Returning false is not fatal: main.cpp falls back to the persisted HID
+// mode for that boot, on the grounds that a working latency tester beats
+// a device that enumerates as nothing.
+bool boardStorageBegin(uint32_t *blockCount, uint16_t *blockSize);
+
+// Raw block I/O, wired straight to the MSC read/write callbacks — so
+// these run on the TinyUSB task, not loop(), and `size` may cover less
+// than a whole block (`offset` says where within it). Return the number
+// of bytes handled, or a negative value to fail the SCSI command.
+//
+// Blocking on flash is fine here and nowhere else in this firmware:
+// nothing is being timed in a MODE_STORAGE boot, so the cache stall a
+// write costs lands in no measurement.
+int32_t boardStorageRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t size);
+int32_t boardStorageWrite(uint32_t lba, uint32_t offset, const uint8_t *buffer, uint32_t size);
+
+// The host issued START STOP UNIT with eject set — it has flushed its
+// caches and let go of the volume. Purely a display cue: it is the one
+// moment the device can honestly say "safe to unplug now". Called from
+// the TinyUSB task, so implementations must be as cheap as the other
+// cross-core pokes here.
+void boardShowStorageEjected();
+
+// Implemented in main.cpp; the persisted "next boot is a drive" flag,
+// which lives with the rest of the mode state rather than in the board
+// layer because it is the same kind of thing pendingMode is: a choice a
+// manual reboot applies. Deliberately NOT folded into the stored mode —
+// that has to go on remembering which HID identity to come back to, so
+// two values were needed either way.
+//
+// Called from the board's menu, both ways: to arm a drive from an
+// ordinary boot, and to disarm one from the drive screen itself.
+void appSetStorageArmed(bool armed);
+bool appStorageArmed();
 
 // Implemented in main.cpp; called by the board's measurement code as
 // soon as a measurement resolves, and before the board drops the busy

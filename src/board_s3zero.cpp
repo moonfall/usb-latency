@@ -116,3 +116,38 @@ void boardShowPending(Mode active, Mode pending, bool firstOfHold) {
 void boardWriteRun(const RunRecord &run) {
   (void)run;
 }
+
+// This board's 4MB layout is stock default.csv — one app, no data
+// partition of any kind — so there is nothing here to hand a host, and
+// MODE_STORAGE is unreachable by construction. boardHasStorage() saying
+// so is what main.cpp gates on before it even reads the persisted
+// armed flag, so a device that somehow carried one over in NVS still
+// comes up as the HID mode it was left in rather than as a drive with no
+// blocks behind it.
+bool boardHasStorage() {
+  return false;
+}
+
+bool boardStorageBegin(uint32_t *blockCount, uint16_t *blockSize) {
+  (void)blockCount;
+  (void)blockSize;
+  return false;
+}
+
+int32_t boardStorageRead(uint32_t lba, uint32_t offset, void *buffer, uint32_t size) {
+  (void)lba;
+  (void)offset;
+  (void)buffer;
+  (void)size;
+  return -1;  // no medium; the SCSI command fails rather than reads zeros
+}
+
+int32_t boardStorageWrite(uint32_t lba, uint32_t offset, const uint8_t *buffer, uint32_t size) {
+  (void)lba;
+  (void)offset;
+  (void)buffer;
+  (void)size;
+  return -1;
+}
+
+void boardShowStorageEjected() {}
