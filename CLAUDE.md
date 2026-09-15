@@ -131,6 +131,17 @@ report or it isn't measuring the same thing. It does **not** clear the
 existing stats first — reset with a 1s hold beforehand if a clean
 distribution is wanted.
 
+`tools/analyze_runs.html` is the desk-side half of the auto test: a
+standalone, dependency-free page that takes the run CSVs (drag them
+straight off the USB-drive mode) and pools any number of them into
+All/Rising/Falling panels — mean/median/sample-stddev, min/max,
+P1/P5/P10/P90/P95/P99, Tukey-trimmed (1.5×IQR) mean/median with the
+drop count shown, and stacked histograms in the device's own rise/fall
+colours on one shared x-axis with per-bin hover readout. Timeout rows
+are tallied but excluded from the numbers; re-dropping a file replaces
+it rather than double-counting; pooling files from different modes is
+flagged as a warning.
+
 Every run is recorded to flash, on the AtomS3R only: one CSV file per
 run on a wear-levelled FAT partition, named `RUNnnnnn.CSV` from a counter
 kept in NVS. Aborted runs are written too, with whatever they collected.

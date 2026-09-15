@@ -1,0 +1,412 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Run Analyzer — usb-latency</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1d2026;
+    --panel2: #23272e;
+    --text: #d8dce2;
+    --dim: #8b93a0;
+    --rise: #78dce6;    /* cyan  — matches the device's rise colour  */
+    --fall: #ff82dc;    /* magenta — matches the device's fall colour */
+    --warn: #ff8c3c;
+    --accent: #ffbe28;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, sans-serif;
+    font-size: 14px;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--dim); margin-bottom: 16px; }
+
+  #drop {
+    border: 2px dashed #3a404b;
+    border-radius: 10px;
+    padding: 28px;
+    text-align: center;
+    color: var(--dim);
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+    margin-bottom: 16px;
+  }
+  #drop.hover { border-color: var(--accent); background: #1d2026; color: var(--text); }
+  #drop input { display: none; }
+
+  #files { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
+  .filecard {
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 8px 12px;
+    font-size: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .filecard b { font-size: 13px; }
+  .filecard .meta { color: var(--dim); }
+  .filecard .aborted { color: var(--warn); }
+  .filecard button {
+    background: none;
+    border: none;
+    color: var(--dim);
+    font-size: 15px;
+    cursor: pointer;
+    padding: 0 2px;
+  }
+  .filecard button:hover { color: #ff6b6b; }
+  .filecard .parseerr { color: #ff6b6b; }
+
+  .section {
+    background: var(--panel);
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 18px;
+  }
+  .section h2 { font-size: 15px; margin: 0 0 2px; }
+  .section .count { color: var(--dim); font-size: 12px; margin-bottom: 12px; }
+  .section.rise h2 { color: var(--rise); }
+  .section.fall h2 { color: var(--fall); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(118px, 1fr));
+    gap: 8px;
+    margin-bottom: 14px;
+  }
+  .stat {
+    background: var(--panel2);
+    border-radius: 6px;
+    padding: 7px 10px;
+  }
+  .stat .k { color: var(--dim); font-size: 11px; letter-spacing: 0.03em; }
+  .stat .v { font-size: 15px; font-variant-numeric: tabular-nums; margin-top: 1px; }
+  .stat.trimmed { outline: 1px solid #3a404b; }
+
+  canvas { width: 100%; height: 190px; display: block; border-radius: 6px; background: var(--panel2); }
+  .hist-note { color: var(--dim); font-size: 11px; margin-top: 6px; min-height: 14px; }
+  #empty { color: var(--dim); text-align: center; padding: 30px 0; }
+</style>
+</head>
+<body>
+<h1>Run Analyzer</h1>
+<div class="sub">Drop <code>RUNnnnnn.CSV</code> files from the device's USB-drive mode. All loaded files are pooled; timings shown in milliseconds.</div>
+
+<div id="drop">
+  Drop CSV files here — or click to choose
+  <input type="file" id="picker" multiple accept=".csv,text/csv">
+</div>
+<div id="files"></div>
+<div id="out"><div id="empty">No data loaded yet.</div></div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- state -----------------------------------------------------------
+  // Each entry: { name, meta: {run, mode, planned, recorded, aborted},
+  //               samples: [{gapMs, rise, latencyUs|null}], error|null }
+  let files = [];
+
+  // ---- parsing ---------------------------------------------------------
+  function parseCsv(name, text) {
+    const meta = { run: null, mode: null, planned: null, recorded: null, aborted: null };
+    const samples = [];
+    let sawHeader = false;
+
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      if (line.startsWith("#")) {
+        const body = line.replace(/^#\s*/, "");
+        const m = body.match(/^usb-latency run (\d+)/);
+        if (m) { meta.run = +m[1]; continue; }
+        const kv = body.split(",");
+        if (kv.length === 2) {
+          const k = kv[0].trim(), v = kv[1].trim();
+          if (k === "mode") meta.mode = v;
+          else if (k === "planned") meta.planned = +v;
+          else if (k === "recorded") meta.recorded = +v;
+          else if (k === "aborted") meta.aborted = (v === "yes");
+        }
+        continue;
+      }
+
+      if (line.startsWith("seq,")) { sawHeader = true; continue; }
+
+      const parts = line.split(",");
+      if (parts.length < 5) continue;
+      const gapMs = +parts[1];
+      const rise = parts[2] === "R";
+      const status = parts[4];
+      // Timeouts carry an empty latency column by design; keep the row
+      // (it counts toward the timeout tally) with latencyUs = null.
+      const latencyUs = status === "ok" && parts[3] !== "" ? +parts[3] : null;
+      if (status !== "ok" && status !== "timeout") continue;
+      samples.push({ gapMs, rise, latencyUs });
+    }
+
+    if (!sawHeader || samples.length === 0) {
+      return { name, meta, samples: [], error: "not a run CSV (no data rows found)" };
+    }
+    return { name, meta, samples, error: null };
+  }
+
+  // ---- statistics ------------------------------------------------------
+  function percentile(sorted, p) {
+    // Linear interpolation between closest ranks (R type 7, the common
+    // spreadsheet/NumPy default) — sorted ascending, p in [0,100].
+    if (sorted.length === 0) return NaN;
+    if (sorted.length === 1) return sorted[0];
+    const idx = (p / 100) * (sorted.length - 1);
+    const lo = Math.floor(idx), hi = Math.ceil(idx);
+    return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
+  }
+
+  function computeStats(valuesUs, timeouts) {
+    const sorted = valuesUs.slice().sort((a, b) => a - b);
+    const n = sorted.length;
+    if (n === 0) return { n: 0, timeouts };
+
+    const mean = sorted.reduce((a, b) => a + b, 0) / n;
+    const median = percentile(sorted, 50);
+    // Sample standard deviation (n-1): these runs are a sample of the
+    // machine's behaviour, not the whole population of it.
+    const sd = n > 1
+      ? Math.sqrt(sorted.reduce((a, v) => a + (v - mean) * (v - mean), 0) / (n - 1))
+      : 0;
+
+    // Outliers by Tukey fences: outside [Q1 - 1.5*IQR, Q3 + 1.5*IQR].
+    const q1 = percentile(sorted, 25), q3 = percentile(sorted, 75);
+    const iqr = q3 - q1;
+    const lo = q1 - 1.5 * iqr, hi = q3 + 1.5 * iqr;
+    const trimmed = sorted.filter(v => v >= lo && v <= hi);
+    const tMean = trimmed.length
+      ? trimmed.reduce((a, b) => a + b, 0) / trimmed.length : NaN;
+    const tMedian = percentile(trimmed, 50);
+
+    return {
+      n, timeouts, mean, median, sd,
+      min: sorted[0], max: sorted[n - 1],
+      p: Object.fromEntries([1, 5, 10, 90, 95, 99].map(p => [p, percentile(sorted, p)])),
+      dropped: n - trimmed.length, tMean, tMedian,
+      sorted,
+    };
+  }
+
+  // ---- rendering -------------------------------------------------------
+  const ms = us => (us / 1000).toFixed(2);
+
+  function statCells(s) {
+    if (s.n === 0) {
+      return `<div class="stat"><div class="k">samples</div><div class="v">0</div></div>` +
+             `<div class="stat"><div class="k">timeouts</div><div class="v">${s.timeouts}</div></div>`;
+    }
+    const cells = [
+      ["samples", s.n], ["timeouts", s.timeouts],
+      ["min ms", ms(s.min)], ["max ms", ms(s.max)],
+      ["mean ms", ms(s.mean)], ["median ms", ms(s.median)],
+      ["std dev ms", ms(s.sd)],
+      ["P1", ms(s.p[1])], ["P5", ms(s.p[5])], ["P10", ms(s.p[10])],
+      ["P90", ms(s.p[90])], ["P95", ms(s.p[95])], ["P99", ms(s.p[99])],
+    ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`);
+    // Trimmed pair visually set apart: same grid, outlined.
+    cells.push(
+      `<div class="stat trimmed"><div class="k">mean ms (no outliers, −${s.dropped})</div><div class="v">${ms(s.tMean)}</div></div>`,
+      `<div class="stat trimmed"><div class="k">median ms (no outliers)</div><div class="v">${ms(s.tMedian)}</div></div>`
+    );
+    return cells.join("");
+  }
+
+  // One shared bin layout for every histogram, so the three charts sit on
+  // the same x axis and can be compared by eye. Bin count via
+  // Freedman–Diaconis on the pooled data, clamped to something readable.
+  function binLayout(allStats) {
+    const s = allStats;
+    const span = s.max - s.min || 1;
+    let bins = 60;
+    const iqr = s.p ? null : null; // FD below uses quartiles from sorted
+    const q1 = percentile(s.sorted, 25), q3 = percentile(s.sorted, 75);
+    const fdWidth = 2 * (q3 - q1) / Math.cbrt(s.n);
+    if (fdWidth > 0) bins = Math.round(span / fdWidth);
+    bins = Math.max(10, Math.min(120, bins || 60));
+    return { min: s.min, span, bins };
+  }
+
+  function drawHistogram(canvas, note, layout, series) {
+    // series: [{values (µs array), color}] — drawn stacked in order.
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, w, h);
+
+    const padB = 18, padT = 6;
+    const counts = series.map(() => new Array(layout.bins).fill(0));
+    series.forEach((ser, si) => {
+      for (const v of ser.values) {
+        let b = Math.floor(((v - layout.min) / layout.span) * layout.bins);
+        if (b >= layout.bins) b = layout.bins - 1;
+        if (b < 0) b = 0;
+        counts[si][b]++;
+      }
+    });
+    let maxTotal = 1;
+    for (let b = 0; b < layout.bins; b++) {
+      const t = counts.reduce((a, c) => a + c[b], 0);
+      if (t > maxTotal) maxTotal = t;
+    }
+
+    const barW = w / layout.bins;
+    for (let b = 0; b < layout.bins; b++) {
+      let y = h - padB;
+      series.forEach((ser, si) => {
+        const bh = (counts[si][b] / maxTotal) * (h - padB - padT);
+        if (bh > 0) {
+          ctx.fillStyle = ser.color;
+          ctx.fillRect(b * barW + 0.5, y - bh, Math.max(1, barW - 1), bh);
+          y -= bh;
+        }
+      });
+    }
+
+    ctx.fillStyle = "#8b93a0";
+    ctx.font = "11px system-ui";
+    ctx.textBaseline = "bottom";
+    ctx.textAlign = "left";
+    ctx.fillText(ms(layout.min) + " ms", 4, h - 4);
+    ctx.textAlign = "right";
+    ctx.fillText(ms(layout.min + layout.span) + " ms", w - 4, h - 4);
+    ctx.textAlign = "center";
+    ctx.fillText("peak bin: " + maxTotal, w / 2, h - 4);
+
+    // Hover readout: which bin, its range and per-series counts.
+    canvas.onmousemove = e => {
+      const b = Math.min(layout.bins - 1,
+        Math.max(0, Math.floor((e.offsetX / w) * layout.bins)));
+      const lo = layout.min + (layout.span * b) / layout.bins;
+      const hi = layout.min + (layout.span * (b + 1)) / layout.bins;
+      const parts = series.map((ser, si) => counts[si][b]);
+      note.textContent = `bin ${b + 1}/${layout.bins}: ${ms(lo)}–${ms(hi)} ms — ` +
+        (parts.length === 2 ? `rise ${parts[1]}, fall ${parts[0]}` : `count ${parts[0]}`);
+    };
+    canvas.onmouseleave = () => { note.textContent = ""; };
+  }
+
+  function render() {
+    const filesDiv = document.getElementById("files");
+    filesDiv.innerHTML = files.map((f, i) => {
+      const m = f.meta;
+      const info = f.error
+        ? `<span class="parseerr">${f.error}</span>`
+        : `<span class="meta">run ${m.run ?? "?"} · ${m.mode ?? "?"} · ` +
+          `${f.samples.length} rows${m.aborted ? ` · <span class="aborted">aborted</span>` : ""}</span>`;
+      return `<div class="filecard"><b>${f.name}</b>${info}` +
+             `<button data-i="${i}" title="remove">✕</button></div>`;
+    }).join("");
+    filesDiv.querySelectorAll("button").forEach(btn => {
+      btn.onclick = () => { files.splice(+btn.dataset.i, 1); render(); };
+    });
+
+    const out = document.getElementById("out");
+    const all = files.flatMap(f => f.samples);
+    if (all.length === 0) {
+      out.innerHTML = `<div id="empty">No data loaded yet.</div>`;
+      return;
+    }
+
+    const okAll = all.filter(s => s.latencyUs !== null);
+    const rise = okAll.filter(s => s.rise).map(s => s.latencyUs);
+    const fall = okAll.filter(s => !s.rise).map(s => s.latencyUs);
+    const toAll = all.filter(s => s.latencyUs === null);
+
+    const sAll = computeStats(okAll.map(s => s.latencyUs), toAll.length);
+    const sRise = computeStats(rise, toAll.filter(s => s.rise).length);
+    const sFall = computeStats(fall, toAll.filter(s => !s.rise).length);
+    const layout = sAll.n ? binLayout(sAll) : null;
+
+    const cssRise = getComputedStyle(document.documentElement).getPropertyValue("--rise").trim();
+    const cssFall = getComputedStyle(document.documentElement).getPropertyValue("--fall").trim();
+
+    const modes = [...new Set(files.filter(f => !f.error).map(f => f.meta.mode).filter(Boolean))];
+    const modeNote = modes.length > 1
+      ? ` — <span style="color:var(--warn)">mixing modes: ${modes.join(", ")}</span>`
+      : modes.length === 1 ? ` — ${modes[0]}` : "";
+
+    out.innerHTML = `
+      <div class="section" id="sec-all">
+        <h2>All readings</h2>
+        <div class="count">${files.filter(f => !f.error).length} file(s)${modeNote}</div>
+        <div class="stats">${statCells(sAll)}</div>
+        <canvas></canvas><div class="hist-note"></div>
+      </div>
+      <div class="section rise" id="sec-rise">
+        <h2>Rising</h2><div class="count">sensor crossed the threshold upward</div>
+        <div class="stats">${statCells(sRise)}</div>
+        <canvas></canvas><div class="hist-note"></div>
+      </div>
+      <div class="section fall" id="sec-fall">
+        <h2>Falling</h2><div class="count">sensor crossed the threshold downward</div>
+        <div class="stats">${statCells(sFall)}</div>
+        <canvas></canvas><div class="hist-note"></div>
+      </div>`;
+
+    if (!layout) return;
+    const draw = (sel, series) => {
+      const sec = document.querySelector(sel);
+      drawHistogram(sec.querySelector("canvas"), sec.querySelector(".hist-note"), layout, series);
+    };
+    // Stacked on the All chart: fall from the baseline, rise on top —
+    // same convention as the device's on-screen histogram.
+    draw("#sec-all", [{ values: fall, color: cssFall }, { values: rise, color: cssRise }]);
+    draw("#sec-rise", [{ values: rise, color: cssRise }]);
+    draw("#sec-fall", [{ values: fall, color: cssFall }]);
+  }
+
+  // Redraw on resize so canvas backing stores stay sharp.
+  let resizeTimer = null;
+  window.addEventListener("resize", () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(render, 150);
+  });
+
+  // ---- input plumbing ----------------------------------------------------
+  function addFiles(fileList) {
+    const readers = [...fileList].map(f =>
+      f.text().then(text => parseCsv(f.name, text)));
+    Promise.all(readers).then(parsed => {
+      // Replace an already-loaded file of the same name rather than
+      // duplicating it — re-dropping a folder shouldn't double the data.
+      for (const p of parsed) {
+        const i = files.findIndex(f => f.name === p.name);
+        if (i >= 0) files[i] = p; else files.push(p);
+      }
+      files.sort((a, b) => a.name.localeCompare(b.name));
+      render();
+    });
+  }
+
+  const drop = document.getElementById("drop");
+  const picker = document.getElementById("picker");
+  drop.onclick = () => picker.click();
+  picker.onchange = () => { addFiles(picker.files); picker.value = ""; };
+  drop.ondragover = e => { e.preventDefault(); drop.classList.add("hover"); };
+  drop.ondragleave = () => drop.classList.remove("hover");
+  drop.ondrop = e => {
+    e.preventDefault();
+    drop.classList.remove("hover");
+    addFiles(e.dataTransfer.files);
+  };
+})();
+</script>
+</body>
+</html>
