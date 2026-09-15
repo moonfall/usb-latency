@@ -14,7 +14,7 @@
 // the life of a boot. The light meter deliberately is NOT one of these:
 // it touches no USB state, so making it a mode would have saddled it with
 // a reboot it doesn't need. It's a view the board layer toggles live
-// instead — see boardToggleMeter().
+// instead — from its own menu, on boards that have one (see board.h).
 enum Mode : uint8_t {
   MODE_GAMEPAD = 0,
   MODE_KEYBOARD,

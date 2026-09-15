@@ -45,18 +45,27 @@ void boardBegin() {
 
 // No Grove port and no screen, so there is nothing to measure with and
 // nowhere to put a reading. The hold ladder collapses to its one original
-// rung and the three calls below are all no-ops.
+// rung, and the menu functions below are all no-ops since there's no
+// screen to draw one on.
 bool boardHasSensor() {
   return false;
 }
 
 void boardResetStats() {}
 
-void boardToggleMeter() {}
-
 void boardShowHoldHint(HoldRung next) {
   (void)next;  // one rung, and a single LED can't spell it out anyway
 }
+
+// No screen, so no menu to open — the button stays exactly what it
+// always was: short press sends the action, holding cycles the pending
+// mode. main.cpp checks boardHasSensor() before ever asking about the
+// menu, but these are still needed to satisfy the shared board.h
+// contract that board_atoms3r.cpp implements for real.
+bool boardMenuActive() { return false; }
+void boardEnterMenu() {}
+void boardMenuTap() {}
+void boardMenuSelect() {}
 
 bool boardButtonPressed() {
   return digitalRead(BOOT_BUTTON_PIN) == LOW;  // active-low

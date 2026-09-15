@@ -4,27 +4,41 @@
  * Emulates exactly ONE USB HID device at a time — gamepad ("X" button),
  * keyboard (Space), or mouse (left click) — selected by the board's one
  * button:
- * The one button carries everything, as a ladder of hold durations:
- *   - Short press: send the active mode's action (and, on a board with a
- *     light sensor, time the display's response to it).
- *   - Hold 2s: reset the measurement statistics.
- *   - Hold 4s: toggle between the latency readout and the raw light
- *     meter. Live — no reboot, no change to the USB identity.
- *   - Hold 7s, and every MODE_HOLD_MS after: select the next mode as
- *     "pending" and persist it to NVS. This does NOT reboot or change
- *     what's active this session; a manual reboot (reset button, or
- *     unplug/replug) is required for it to take effect.
- * The first two rungs only exist on a board with a sensor. Without one
- * the ladder collapses to its single original rung, with the mode cycle
- * back at MODE_HOLD_MS (3s) where it has always been.
+ * On a board with a sensor (a screen to put a menu on), the button works
+ * in two entirely different ways depending on whether the menu is open:
  *
- * Note what is NOT on that ladder: the light meter is not a Mode. A Mode
- * is a USB identity, which is why it's stuck until a reboot — and the
- * meter touches no USB state whatsoever, so tying it to one would have
- * cost a reboot for nothing. It's a view the board layer flips at
- * runtime, and presses keep sending their HID report while it's up, which
- * is exactly what you want when aiming the sensor: press the button,
- * watch the thing you're pointing at change, and watch the bar move.
+ *   Normal operation
+ *     - Short press: send the active mode's action, and time the
+ *       display's response to it.
+ *     - Hold 1s: reset the measurement statistics.
+ *     - Hold 2s: open the menu. From here on, presses are menu input,
+ *       not HID input — see below — until the menu exits on its own.
+ *
+ *   Inside the menu
+ *     - Short press: advance — move the highlighted item, or, inside the
+ *       mode picker, advance the candidate mode.
+ *     - Hold 1s: trigger the highlighted item's action.
+ *   The menu holds the light meter (a live view, toggled instantly) and
+ *   changing the pending mode (see appAdvancePendingMode()) — both used
+ *   to be hold-ladder rungs of their own; moving them into a proper menu
+ *   is what let short-press-to-advance and hold-to-select behave the
+ *   same way at every level, instead of every feature inventing its own
+ *   hold duration to remember.
+ *
+ * A board with no sensor (no screen to draw a menu on) never has one:
+ * the button stays exactly what it always was — short press sends the
+ * action, and holding advances the pending mode one step per
+ * MODE_HOLD_MS (3s) for as long as it's held.
+ *
+ * Note what is NOT part of any of this: the light meter is not a Mode. A
+ * Mode is a USB identity, which is why it's stuck until a reboot — and
+ * the meter touches no USB state whatsoever, so tying it to one would
+ * have cost a reboot for nothing. It's a view the board layer flips at
+ * runtime. (Outside the menu, presses keep sending their HID report
+ * while the meter view is up, which is exactly what you want when aiming
+ * the sensor: press the button, watch the thing you're pointing at
+ * change, and watch the bar move. Inside the menu, no press sends HID at
+ * all — see above.)
  *
  * Two boards are supported, one PlatformIO env each. Everything specific
  * to a board — which pin the button is on, and how state is shown — lives
@@ -101,12 +115,17 @@
 // --- Configuration ---------------------------------------------------
 static const uint32_t DEBOUNCE_MS = 25;     // lockout window after a trigger
 
-// The hold ladder. The first two rungs exist only where boardHasSensor();
-// the mode rung then follows MODE_HOLD_MS after the last rung that does
-// exist, and repeats at that interval for as long as the button is held.
-// So: 2s / 4s / 7s / 10s ... with a sensor, and plain 3s / 6s ... without.
-static const uint32_t STATS_HOLD_MS = 2000;
-static const uint32_t METER_HOLD_MS = 4000;
+// Normal-operation ladder, board-with-a-sensor only: two one-shot rungs,
+// each firing once per hold as the threshold is crossed.
+static const uint32_t STATS_HOLD_MS = 1000;  // hold 1s -> reset stats
+static const uint32_t MENU_HOLD_MS = 2000;   // hold 2s -> open the menu
+
+// Inside the menu: how long a hold has to be to trigger the highlighted
+// item, as opposed to a short press-and-release advancing it instead.
+static const uint32_t MENU_SELECT_HOLD_MS = 1000;
+
+// Board-with-no-sensor only: the one original rung, repeating at this
+// interval for as long as the button stays held.
 static const uint32_t MODE_HOLD_MS = 3000;
 
 static const char *PREFS_NAMESPACE = "usbmode";
@@ -126,21 +145,25 @@ static USBHIDKeyboard *keyboard = nullptr;
 static USBHIDMouse *mouse = nullptr;
 
 static bool stableState = false;   // false = released, true = pressed
-static uint32_t lastTriggerMs = 0;
-static uint32_t nextCycleMs = 0;   // when the current hold next advances pendingMode
+static uint32_t lastTriggerMs = 0;   // also this press's start time, while held
+static uint32_t nextCycleMs = 0;     // no-sensor board only: next mode-cycle rung
 static bool cycledThisHold = false;  // true once this hold has advanced the mode at least once
 
-// Rungs still ahead in the current hold, with the time each one fires.
+// Normal-operation ladder (board with a sensor only). Each rung fires at
+// most once per hold, as the threshold is crossed.
 static bool statsRungAhead = false;
 static uint32_t statsAtMs = 0;
-static bool meterRungAhead = false;
-static uint32_t meterAtMs = 0;
+static bool menuRungAhead = false;
+static uint32_t menuAtMs = 0;
 
-// The rung a fresh hold would reach first — also what the hint falls back
-// to on release.
-static inline HoldRung firstRung() {
-  return boardHasSensor() ? RUNG_STATS : RUNG_MODE;
-}
+// Captured once, at the press edge, rather than re-checked live: if a
+// hold is the one that opens the menu partway through (crossing
+// MENU_HOLD_MS below), its own eventual release must still read as an
+// ordinary HID release — not get mistaken for the menu's first
+// navigation tap, which is what a live boardMenuActive() check at
+// release time would do, since the menu is open by then.
+static bool wasMenuActiveAtPress = false;
+static bool menuActionTaken = false;  // this hold already triggered the highlighted item
 
 static inline void sendPress() {
   switch (activeMode) {
@@ -162,12 +185,25 @@ static inline void sendRelease() {
 
 // Advances pendingMode by one and persists it — takes effect on the next
 // manual reboot, not this session.
-static void advancePendingMode() {
+static void doAdvancePendingMode(bool firstOfHold) {
   pendingMode = static_cast<Mode>((pendingMode + 1) % MODE_COUNT);
   prefs.putUChar(PREFS_KEY, pendingMode);
+  boardShowPending(activeMode, pendingMode, firstOfHold);
+}
 
-  boardShowPending(activeMode, pendingMode, !cycledThisHold);
+// Board-with-no-sensor path: one continuous hold can cycle through
+// several modes, so firstOfHold tracks whether this is the first
+// advance within it (see board_s3zero.cpp for what it does with that).
+static void advancePendingMode() {
+  doAdvancePendingMode(!cycledThisHold);
   cycledThisHold = true;
+}
+
+// Menu-driven path (board with a sensor): each advance is its own
+// discrete tap, not a step within a continuous hold, so there is no
+// "first of hold" to report.
+void appAdvancePendingMode() {
+  doAdvancePendingMode(false);
 }
 
 void setup() {
@@ -192,7 +228,7 @@ void setup() {
 
   // Only now that USB is up is it safe to spend time on the indicator.
   boardShowBoot(activeMode, pendingMode);
-  boardShowHoldHint(firstRung());
+  boardShowHoldHint(RUNG_STATS);
 }
 
 void loop() {
@@ -204,44 +240,75 @@ void loop() {
   if ((now - lastTriggerMs) >= DEBOUNCE_MS && raw != stableState) {
     // t0 for latency measurement: the edge itself, before the report is
     // queued, so the HID send counts as part of what's being measured.
+    // Meaningless when the menu is about to own this press, but cheap
+    // enough that skipping it isn't worth the branch.
     int64_t edgeMicros = esp_timer_get_time();
     stableState = raw;
     lastTriggerMs = now;
 
-    // HID report first, feedback second — never the other way round.
     if (stableState) {
-      sendPress();
-      // Lay out this hold's ladder, skipping the rungs the board has no
-      // use for so the mode rung stays where it has always been on a
-      // board without a sensor.
-      cycledThisHold = false;
-      statsRungAhead = meterRungAhead = boardHasSensor();
-      statsAtMs = now + STATS_HOLD_MS;
-      meterAtMs = now + METER_HOLD_MS;
-      nextCycleMs = (boardHasSensor() ? meterAtMs : now) + MODE_HOLD_MS;
+      wasMenuActiveAtPress = boardHasSensor() && boardMenuActive();
+
+      if (wasMenuActiveAtPress) {
+        // Presses inside the menu are navigation only — no HID report,
+        // no measurement. Tap vs. hold-to-select is resolved on release
+        // or by the timer below; nothing fires at the press edge itself.
+        menuActionTaken = false;
+      } else {
+        // HID report first, feedback second — never the other way round.
+        sendPress();
+        boardShowPress(true, activeMode, edgeMicros);
+        cycledThisHold = false;
+        if (boardHasSensor()) {
+          statsRungAhead = true;
+          menuRungAhead = true;
+          statsAtMs = now + STATS_HOLD_MS;
+          menuAtMs = now + MENU_HOLD_MS;
+        } else {
+          nextCycleMs = now + MODE_HOLD_MS;
+        }
+      }
     } else {
-      sendRelease();
-      statsRungAhead = meterRungAhead = false;
-      boardShowHoldHint(firstRung());
+      if (wasMenuActiveAtPress) {
+        // A release before the select threshold fired is a tap; one
+        // that already fired (menuActionTaken) needs nothing further —
+        // see boardMenuSelect() below.
+        if (!menuActionTaken) boardMenuTap();
+      } else {
+        sendRelease();
+        boardShowPress(false, activeMode, edgeMicros);
+        statsRungAhead = menuRungAhead = false;
+        boardShowHoldHint(RUNG_STATS);
+      }
     }
-    boardShowPress(stableState, activeMode, edgeMicros);
   }
 
-  // Walk the ladder for as long as the button stays down. Each rung fires
-  // once per hold, then hands the hint on to the next one.
-  if (stableState) {
+  if (!stableState) return;
+
+  if (wasMenuActiveAtPress) {
+    if (!menuActionTaken && (now - lastTriggerMs) >= MENU_SELECT_HOLD_MS) {
+      menuActionTaken = true;
+      boardMenuSelect();
+    }
+    return;
+  }
+
+  if (boardHasSensor()) {
+    // Two one-shot rungs; nothing repeats after them — continuing to
+    // hold past MENU_HOLD_MS just waits for release, since the menu
+    // (already open by then) is what the rest of the hold belongs to.
     if (statsRungAhead && now >= statsAtMs) {
       statsRungAhead = false;
       boardResetStats();
-      boardShowHoldHint(RUNG_METER);
+      boardShowHoldHint(RUNG_MENU);
     }
-    if (meterRungAhead && now >= meterAtMs) {
-      meterRungAhead = false;
-      boardToggleMeter();
-      boardShowHoldHint(RUNG_MODE);
+    if (menuRungAhead && now >= menuAtMs) {
+      menuRungAhead = false;
+      boardEnterMenu();
     }
-    // The top rung repeats: see the file header for why it only selects a
-    // mode for the next manual reboot, rather than switching live.
+  } else {
+    // No sensor, no menu: the one original rung, repeating for as long
+    // as the button stays down.
     if (now >= nextCycleMs) {
       advancePendingMode();
       nextCycleMs = now + MODE_HOLD_MS;

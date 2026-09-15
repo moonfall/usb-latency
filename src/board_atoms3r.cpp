@@ -34,12 +34,12 @@
  *                 make the display do its thing and watch the bar move
  *                 while you aim.
  *
- * The view toggles live, on a 4s hold — it touches no USB state, so
- * unlike a Mode it costs no reboot. Measurements keep running and keep
- * accumulating underneath the meter, so switching back shows the stats
- * and histogram they built up.
+ * The view toggles from the menu (below), not a hold rung of its own — it
+ * touches no USB state, so unlike a Mode it costs no reboot. Measurements
+ * keep running and keep accumulating underneath the meter, so switching
+ * back shows the stats and histogram they built up.
  *
- * Layout, top to bottom:
+ * Normal-operation layout, top to bottom:
  *
  *     24.38 ms                <- last measurement, coloured by direction
  *   R6 24.9  F7 41.2           <- per-direction n/mean
@@ -55,6 +55,27 @@
  * until the measurement finished anyway, so it was never truly
  * immediate. The recent-measurement line and the histogram are the
  * feedback now, same as they always ended up being in practice.
+ *
+ * A 2s hold from normal operation replaces all of the above with a menu
+ * (see board.h for the full normal/menu button contract — this file just
+ * implements it):
+ *
+ *      MENU                    MENU_TOP: three items, cycled by tap,
+ *    > Light meter              triggered by a 1s+ hold. Light meter
+ *      Change mode              flips meterView and exits immediately;
+ *      Exit                     Change mode drops into the picker below;
+ *   tap: next  hold: select     Exit just leaves.
+ *
+ *   CHANGE MODE                MENU_MODE: tap advances the candidate via
+ *     KEYBOARD                  appAdvancePendingMode() — the same NVS
+ *   on next reset                write the old hold-to-cycle gesture did,
+ *   tap: next  hold: confirm    just tap-driven now. Hold exits the menu;
+ *                                the choice is already persisted per tap,
+ *                                so there is nothing left to "confirm".
+ *
+ * While the menu is open, no press reaches the HID/measurement path at
+ * all (see main.cpp) — every press is menu input until MENU_TOP's Exit,
+ * or MENU_MODE's confirm, returns menuState to MENU_NONE.
  *
  * NOTHING here draws from loop(). All panel access, all ADC sampling and
  * the whole measurement loop happen in one task pinned to core 0
@@ -148,8 +169,22 @@ static volatile Mode wantPending = MODE_GAMEPAD;
 static volatile int64_t pressMicros = 0;
 static volatile bool measurePending = false;
 static volatile bool resetRequested = false;
-static volatile bool meterToggleRequested = false;
+static volatile bool enterMenuRequested = false;
+static volatile bool menuTapRequested = false;
+static volatile bool menuSelectRequested = false;
 static volatile HoldRung wantHint = RUNG_STATS;
+
+// The menu's own state — see the file header for what each level looks
+// like. menuState is volatile because boardMenuActive() (below) is
+// called from main.cpp on core 1; topIndex never is, so it doesn't need
+// to be.
+enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE };
+static volatile MenuState menuState = MENU_NONE;
+static int topIndex = 0;
+static const int NUM_TOP_ITEMS = 3;
+static const char *TOP_ITEM_LABELS[NUM_TOP_ITEMS] = {
+  "Light meter", "Change mode", "Exit"
+};
 
 // Measurement results. Touched only by uiTask, so no synchronisation.
 // Kept as two separate populations, not pooled — see the file header on
@@ -192,7 +227,8 @@ static History histRise;
 static History histFall;
 
 // Which of the two top-strip views is up. Owned by uiTask, flipped only
-// in response to meterToggleRequested.
+// from within the menu's "Light meter" item (see menuSelectRequested
+// handling in uiTaskFn).
 static bool meterView = false;
 
 static uint16_t black() { return display.color565(0, 0, 0); }
@@ -378,8 +414,7 @@ static void drawNextLine(Mode active, Mode pending, HoldRung hint) {
     const char *text = "";
     switch (hint) {
       case RUNG_STATS: text = "hold: reset stats"; break;
-      case RUNG_METER: text = meterView ? "hold: latency view" : "hold: light meter"; break;
-      case RUNG_MODE:  text = "hold: next mode"; break;
+      case RUNG_MENU:  text = "hold: open menu"; break;
     }
     snprintf(buf, sizeof(buf), "%s", text);
     color = dimColor();
@@ -466,14 +501,78 @@ static void drawHistogram() {
   display.drawString(hiBuf, SCREEN_W - 1, HIST_LABEL_Y);
 }
 
+// MENU_TOP: the three items, one per line, with the current selection
+// picked out in amber. A tap (below) cycles topIndex; a hold (below)
+// triggers whichever item is highlighted.
+static void drawMenuTop() {
+  uint16_t dim = dimColor();
+  uint16_t hi = display.color565(255, 190, 40);  // amber, matches the pending-mode colour
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  display.drawString("MENU", SCREEN_W / 2, 6);
+
+  const int rowH = 16;
+  const int top = 28;
+  char buf[24];
+  for (int i = 0; i < NUM_TOP_ITEMS; i++) {
+    bool selected = (i == topIndex);
+    snprintf(buf, sizeof(buf), selected ? "> %s" : "%s", TOP_ITEM_LABELS[i]);
+    display.setTextColor(selected ? hi : dim, black());
+    display.drawString(buf, SCREEN_W / 2, top + i * rowH);
+  }
+
+  display.setTextColor(dim, black());
+  display.drawString("tap: next", SCREEN_W / 2, 96);
+  display.drawString("hold: select", SCREEN_W / 2, 108);
+}
+
+// MENU_MODE: the mode picker. pendingMode is the candidate a tap here
+// advances (via appAdvancePendingMode(), which persists it immediately —
+// there is nothing left for the hold to "confirm" beyond leaving the
+// menu), shown big and in its own colour, same as the old headline used
+// to be for the active mode.
+static void drawMenuMode(Mode active, Mode pending) {
+  uint16_t dim = dimColor();
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  display.drawString("CHANGE MODE", SCREEN_W / 2, 6);
+
+  display.setTextDatum(textdatum_t::middle_center);
+  display.setTextColor(modeColor(pending), black());
+  display.setFont(&fonts::Font4);
+  if (display.textWidth(modeName(pending)) > SCREEN_W - 8) {
+    display.setFont(&fonts::Font2);
+  }
+  display.drawString(modeName(pending), SCREEN_W / 2, 52);
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  if (pending != active) {
+    display.drawString("on next reset", SCREEN_W / 2, 76);
+  }
+  display.drawString("tap: next", SCREEN_W / 2, 96);
+  display.drawString("hold: confirm", SCREEN_W / 2, 108);
+}
+
 static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung hint) {
   display.startWrite();
   display.fillScreen(black());
 
-  drawTopStrip(raw, mv);
-  drawModeLine(active);
-  drawNextLine(active, pending, hint);
-  drawHistogram();
+  if (menuState == MENU_TOP) {
+    drawMenuTop();
+  } else if (menuState == MENU_MODE) {
+    drawMenuMode(active, pending);
+  } else {
+    drawTopStrip(raw, mv);
+    drawModeLine(active);
+    drawNextLine(active, pending, hint);
+    drawHistogram();
+  }
 
   display.endWrite();
 }
@@ -493,6 +592,8 @@ static void uiTaskFn(void *) {
   Mode shownPending = MODE_COUNT; // the first pass to draw a full frame
   bool shownMeter = false;
   HoldRung shownHint = RUNG_STATS;
+  MenuState shownMenuState = MENU_TOP;  // != MENU_NONE, same forcing trick
+  int shownTopIndex = -1;
   int shownRaw = -1;
 
   int raw = 0;
@@ -516,18 +617,48 @@ static void uiTaskFn(void *) {
       histFall = History();
       statsCleared = true;
     }
-    if (meterToggleRequested) {
-      meterToggleRequested = false;
-      meterView = !meterView;
+    // Menu requests, likewise deferred here rather than acted on where
+    // they're raised (main.cpp, on core 1) — see boardEnterMenu() etc.
+    // below. All three read-modify-write menuState/topIndex, so keeping
+    // them on this one core is what makes that safe without a lock.
+    if (enterMenuRequested) {
+      enterMenuRequested = false;
+      menuState = MENU_TOP;
+      topIndex = 0;
+    }
+    if (menuTapRequested) {
+      menuTapRequested = false;
+      if (menuState == MENU_TOP) {
+        topIndex = (topIndex + 1) % NUM_TOP_ITEMS;
+      } else if (menuState == MENU_MODE) {
+        appAdvancePendingMode();
+      }
+    }
+    if (menuSelectRequested) {
+      menuSelectRequested = false;
+      if (menuState == MENU_TOP) {
+        switch (topIndex) {
+          case 0: meterView = !meterView; menuState = MENU_NONE; break;  // Light meter
+          case 1: menuState = MENU_MODE; break;                          // Change mode
+          case 2: menuState = MENU_NONE; break;                          // Exit
+        }
+      } else if (menuState == MENU_MODE) {
+        // pendingMode is already persisted per tap — nothing to do here
+        // but leave.
+        menuState = MENU_NONE;
+      }
     }
 
+    bool inMenu = (menuState != MENU_NONE);
     bool newFrame = (active != shownActive || pending != shownPending ||
-                     meterView != shownMeter);
+                     meterView != shownMeter ||
+                     menuState != shownMenuState || topIndex != shownTopIndex);
     // A clear only shows up in the measure view's top strip; the meter
     // view is live anyway and will repaint on its own cadence. The
     // histogram is visible in both views, so it always needs redrawing.
-    bool topDirty = statsCleared && !meterView;
-    bool histDirty = statsCleared;
+    // Neither applies while the menu is up — it draws over both.
+    bool topDirty = statsCleared && !meterView && !inMenu;
+    bool histDirty = statsCleared && !inMenu;
 
     if (newFrame) shownRaw = -1;  // whatever is cached belongs to the old view
 
@@ -562,8 +693,13 @@ static void uiTaskFn(void *) {
         shownPending = pending;
         shownMeter = meterView;
         shownHint = hint;
+        shownMenuState = menuState;
+        shownTopIndex = topIndex;
         shownRaw = raw;
-      } else {
+      } else if (!inMenu) {
+        // The menu redraws only via newFrame above (any change to
+        // menuState/topIndex is one of its conditions) — nothing here
+        // applies while it's up.
         if (topDirty) {
           display.startWrite();
           drawTopStrip(raw, mv);
@@ -599,7 +735,8 @@ void boardBegin() {
 }
 
 // Light sensor on the Grove port plus a screen to put the answer on, so
-// this board gets the full hold ladder.
+// this board gets the full normal-operation ladder and the menu built on
+// top of it (see the file header and board.h).
 bool boardHasSensor() {
   return true;
 }
@@ -609,13 +746,27 @@ void boardResetStats() {
   nudgeUi();
 }
 
-void boardToggleMeter() {
-  meterToggleRequested = true;
+void boardShowHoldHint(HoldRung next) {
+  wantHint = next;
   nudgeUi();
 }
 
-void boardShowHoldHint(HoldRung next) {
-  wantHint = next;
+bool boardMenuActive() {
+  return menuState != MENU_NONE;
+}
+
+void boardEnterMenu() {
+  enterMenuRequested = true;
+  nudgeUi();
+}
+
+void boardMenuTap() {
+  menuTapRequested = true;
+  nudgeUi();
+}
+
+void boardMenuSelect() {
+  menuSelectRequested = true;
   nudgeUi();
 }
 

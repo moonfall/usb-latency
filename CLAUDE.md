@@ -18,19 +18,30 @@ clock at the button edge and stops it when the light crosses
 `LIGHT_THRESHOLD` (default 3000 ADC counts), so the figure on screen
 covers button-down → USB → host → compositor → panel.
 
-The one button carries everything, as a ladder of hold durations:
+The one button drives two entirely different things depending on whether
+a menu (AtomS3R only) is open:
 
-| hold | action | needs a sensor |
-| --- | --- | --- |
-| press | send the mode's HID report, and time the response | — |
-| 2s | reset the measurement statistics | yes |
-| 4s | toggle the light-meter view (live, no reboot) | yes |
-| 7s, then every 3s | advance the *pending* mode (reboot to apply) | — |
+| state | gesture | action | needs a sensor |
+| --- | --- | --- | --- |
+| normal | press | send the mode's HID report, and time the response | — |
+| normal | hold 1s | reset the measurement statistics | yes |
+| normal | hold 2s | open the menu (below) | yes |
+| normal | hold 3s, repeating | advance the *pending* mode (reboot to apply) | no (S3-Zero only) |
+| menu | tap | advance — move the selection, or the mode-picker's candidate | yes |
+| menu | hold 1s | trigger the highlighted item | yes |
 
-Rungs the board can't use don't exist, and the rest close up: on the
-S3-Zero the ladder is just the original 3s / 6s / … mode cycle. The
-AtomS3R's footer names the next rung as you hold, which is the only thing
-making a three-rung ladder discoverable.
+The S3-Zero has no screen and so no menu — its button is exactly what it
+always was: press sends the action, holding cycles the pending mode every
+3s. On the AtomS3R, a 2s hold from normal operation opens a small menu
+(`Light meter`, `Change mode`, `Exit`) that owns every subsequent press
+until it exits: tap cycles the highlighted item, a 1s+ hold triggers it.
+`Change mode` drops into a picker where tap advances the candidate mode
+(persisting it immediately, same NVS write the S3-Zero's hold-to-cycle
+gesture always did) and hold confirms by just leaving. `Light meter`
+toggles instantly and exits; `Exit` just exits. No press reaches the
+HID/measurement path while the menu is open — see `wasMenuActiveAtPress`
+in `main.cpp` for how that's decided once per press rather than
+re-checked live.
 
 ## Build
 
@@ -84,10 +95,16 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
 - `src/board.h` — the board I/O contract: `boardBegin()`,
   `boardHasSensor()`, `boardButtonPressed()`, `boardShowBoot()`,
   `boardShowPress()`, `boardShowPending()`, `boardResetStats()`,
-  `boardToggleMeter()`, `boardShowHoldHint()`. main.cpp owns the hold
-  ladder's timing and pushes the resulting hint down, so the board renders
-  a label and never duplicates a threshold. Exactly one implementation is compiled per env, so
-  there are no board `#ifdef`s in `main.cpp` and nothing in the board layer
+  `boardShowHoldHint()`, plus the menu contract —
+  `boardMenuActive()`, `boardEnterMenu()`, `boardMenuTap()`,
+  `boardMenuSelect()`, and `appAdvancePendingMode()` (the one function
+  that runs the other way: implemented in `main.cpp`, called by the
+  board's mode-picker submenu). main.cpp owns the normal-operation
+  ladder's timing and pushes the resulting hint down, so the board
+  renders a label and never duplicates a threshold; it also decides, once
+  per press edge via `boardMenuActive()`, whether that press is HID input
+  or menu input. Exactly one implementation is compiled per env, so there
+  are no board `#ifdef`s in `main.cpp` and nothing in the board layer
   touches USB. Mode state is passed in rather than duplicated there.
 - `src/board_s3zero.cpp` — ESP32-S3-Zero: BOOT button (GPIO0, active-low),
   onboard WS2812 (GPIO21). The LED lights up while the button is held, in a
@@ -100,13 +117,19 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   without pressing the button first.
 - `src/board_atoms3r.cpp` — AtomS3R: screen button (GPIO41, active-low —
   the whole LCD face is the button), 0.85" 128x128 LCD via M5GFX, and the
-  Unit Light's analog output on GPIO1 (ADC1_CH0). Because a screen can
-  show state permanently, it does: the live light reading (raw ADC count,
-  volts, and a bar) across the top, then the active mode's name in its
-  colour, a rounded "action box" naming what a press sends (filled with
-  the mode colour while held, outlined when idle), and a footer that is
-  either `hold 3s: next mode` or — once a hold has queued a change — the
-  pending mode plus `on next reset`.
+  Unit Light's analog output on GPIO1 (ADC1_CH0). There is no separate
+  press indicator (no action box, no LED — see the no-usable-RGB-LED
+  gotcha below); the recent-measurement line and the histogram, below,
+  are the feedback. Normal-operation screen, top to bottom: the last
+  measurement (or the live meter reading, in the meter view — see the
+  light-meter-is-not-a-mode gotcha), the R/F count-and-mean line, the
+  active mode's name, a hint for what continuing to hold would do next
+  (or the pending mode once a hold has queued a change), and a stacked
+  R/F histogram of the last `HIST_CAPACITY` (default 500, overridable)
+  samples of each direction sharing one time axis, with the axis's min
+  and max labelled at its ends. A 2s hold replaces all of that with a
+  small menu instead — see the menu bullet in the interaction table above
+  and the file header in `board_atoms3r.cpp` for the two screens it uses.
 
   **Nothing here draws from `loop()`.** All panel access and all ADC
   sampling happen in one task (`uiTaskFn`) pinned to core 0, while
@@ -118,6 +141,9 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `LIGHT_PERIOD_MS` (100ms) timeout, so it wakes either on a press/release
   edge or on the timeout. `display.init()` also runs in that task, so
   panel autodetect and backlight bring-up are off the critical core too.
+  Menu state (`menuState`, `topIndex`) lives here too, touched only by
+  this task — `loop()` only ever requests a menu action
+  (`enterMenuRequested` etc.), never mutates the menu directly.
 
   `runMeasurement()` is the measurement itself, also on core 0. `t0` is
   `esp_timer_get_time()` sampled in `loop()` at the button edge, *before*
@@ -129,13 +155,11 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   going dark both work off one threshold value. The poll is tight and
   unyielding (`analogRead()` is tens of µs, so it resolves far finer than
   a millisecond), bounded by `MEASURE_TIMEOUT_MS` (500ms) — see the
-  core-0-starvation gotcha below. The top strip shows the last figure plus
-  the count and mean for each direction of crossing (rise/fall through
-  `LIGHT_THRESHOLD`), kept as two separate populations rather than one
-  pooled average, unless the meter view is up — measurements run and
-  accumulate either way, so switching back shows the stats they built
-  while you were aiming. See the direction-bucketing gotcha below for why
-  they're split.
+  core-0-starvation gotcha below. Every successful measurement is recorded
+  twice: into a `DirStats` (running count/min/mean) and into a `History`
+  ring buffer (the last `HIST_CAPACITY` raw values) — one per direction,
+  kept separate rather than pooled. See the direction-bucketing gotcha
+  below for why.
 
 ## Gotchas already hit
 
@@ -269,15 +293,25 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   Caveat not yet checked on hardware: the unit is a 5V part, so if its
   analog swing really does reach 5V it will clip at the ADC's ~3.3V
   ceiling (4095) rather than damaging anything visible in the reading.
-- **A press in a measuring mode doesn't light the action box until the
-  measurement finishes.** This is deliberate, not a dropped frame: the UI
-  task must not be pushing pixels over SPI while it is sampling the
-  sensor, because a repaint both delays the first sample and can straddle
-  the very change being timed. So `boardShowPress()` hands over the
-  timestamp, and the box is repainted after `runMeasurement()` returns —
-  tens of milliseconds normally, `MEASURE_TIMEOUT_MS` in the no-response
-  case. A tap shorter than the measurement may never show the box lit at
-  all.
+- **The on-screen numbers don't update until the measurement finishes.**
+  This is deliberate, not a dropped frame: the UI task must not be
+  pushing pixels over SPI while it is sampling the sensor, because a
+  repaint both delays the first sample and can straddle the very change
+  being timed. So `boardShowPress()` hands over the timestamp, and
+  everything — the recent-measurement line, the histogram — repaints
+  after `runMeasurement()` returns, tens of milliseconds normally,
+  `MEASURE_TIMEOUT_MS` in the no-response case.
+- **While the menu is open, no press reaches `sendPress()`/`sendRelease()`
+  at all.** `main.cpp` decides this once per press, at the edge
+  (`wasMenuActiveAtPress = boardHasSensor() && boardMenuActive()`), and
+  deliberately does *not* re-check `boardMenuActive()` live for the rest
+  of that hold or at release. The reason: the hold that *opens* the menu
+  (crossing the 2s threshold) does so partway through its own press — if
+  release-time code re-checked `boardMenuActive()` fresh, that release
+  would see the menu already open and misfire as the menu's first
+  navigation tap. Capturing the decision once, at the press edge, makes
+  that entry hold's release read as an ordinary HID release (matching the
+  physical gesture the host actually saw) instead.
 - **`runMeasurement()` deliberately starves core 0's idle task**, which is
   why `MEASURE_TIMEOUT_MS` exists and why it is 500ms. The poll loop does
   not yield: yielding on every sample (`vTaskDelay(1)`) would cap
@@ -291,9 +325,10 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `LIGHT_THRESHOLD` defaults to 3000 and is `#ifndef`-guarded, so
   `-DLIGHT_THRESHOLD=<counts>` in an env's `build_flags` overrides it.
   There is no button UI for it: the button already carries press-to-send
-  and hold-to-cycle, and a third gesture would be one too many. `MODE_LIGHT`
-  draws the threshold as a tick on its bar, which is how you check the
-  value is in the right place without being able to edit it live.
+  and hold-to-cycle, and a third gesture would be one too many. The
+  meter view draws the threshold as a tick on its bar, which is how you
+  check the value is in the right place without being able to edit it
+  live.
 - **The light meter is not a `Mode`, and making it one was a mistake worth
   not repeating.** It was briefly `MODE_LIGHT`, a fourth entry in the
   rotation that constructed no HID device — which meant switching into or
@@ -302,9 +337,10 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   couldn't make the display do the thing you were trying to aim at. The
   split that actually holds: a `Mode` is a USB identity (boot-fixed,
   reboot to change, three of them), and the meter is a *view* the board
-  layer flips at runtime (`boardToggleMeter()`, no USB involvement, HID
-  reports and measurements carry on underneath it). If something new needs
-  switching, the first question is which of those two it is.
+  layer flips at runtime — from the menu now (its "Light meter" item), no
+  USB involvement, HID reports and measurements carrying on underneath it
+  whenever the menu isn't the one holding the button. If something new
+  needs switching, the first question is still which of those two it is.
 - **The AtomS3R has no usable RGB status LED — don't try to add one.**
   Confirmed on hardware after a failed attempt. The docs' pin map lists
   "LP5562 (RGB Driver)" on the internal I2C bus, which reads like there's
@@ -316,8 +352,9 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   putting every channel under direct PWM control, so it is only a register
   write per channel — produces no visible light. Whatever the reason
   (unpopulated, or not wired out), there is nothing to drive. The only
-  press indicator on this board is the on-screen action box, and note that
-  it can't repaint until runMeasurement() returns.
+  press indicator on this board is the on-screen recent-measurement line
+  and histogram, and note that neither can repaint until
+  `runMeasurement()` returns.
 - **Latency stats are kept as two populations, R and F, not one pooled
   average.** `runMeasurement()` already knows which way the ADC crossed
   the threshold (`waitForRise`, needed anyway to support both a
