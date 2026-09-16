@@ -226,8 +226,8 @@ static const int LIGHT_DEADBAND = 8;          // counts of ADC noise not worth a
 #endif
 static const int lightThreshold = LIGHT_THRESHOLD;
 
-// How long the meter view's sensor capture samples for (see
-// runSensorCapture()). Unlike the measurement poll below this loop
+// How long each of the threshold calibration's two captures samples for
+// (see runThresholdCal()). Unlike the measurement poll below, this loop
 // yields every sample, so it is not watchdog-bound and 10s is fine.
 #ifndef SENSOR_CAPTURE_MS
 #define SENSOR_CAPTURE_MS 10000
@@ -341,9 +341,11 @@ static volatile uint16_t autoTotal = 0;
 // the point — it makes boardMenuActive() true for that whole boot, which
 // is what keeps every press away from the HID/measurement path without
 // main.cpp knowing storage exists. See the file header.
-// MENU_CAPTURE is the sensor capture's results screen — a menu state for
-// the same reason MENU_DRIVE is one: while it is up, boardMenuActive()
-// keeps the dismissing tap from also being a HID press.
+// MENU_CAPTURE covers the threshold calibration's whole flow — both
+// captures, the tap-to-continue between them, and the results screen. A
+// menu state for the same reason MENU_DRIVE is one: while it is up,
+// boardMenuActive() keeps every press (the continue tap, the dismissing
+// tap, anything stray mid-capture) from also being a HID press.
 enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE, MENU_CAPTURE };
 static volatile MenuState menuState = MENU_NONE;
 static int topIndex = 0;
@@ -815,7 +817,7 @@ static void drawMenuTop() {
     const char *label = TOP_ITEM_LABELS[topItems[i]];
     // In the meter view the Auto test slot runs the sensor capture
     // instead (see the select handler), so it says so.
-    if (topItems[i] == ITEM_AUTO && meterView) label = "Capture 10s";
+    if (topItems[i] == ITEM_AUTO && meterView) label = "Find threshold";
     snprintf(buf, sizeof(buf), selected ? "> %s" : "%s", label);
     display.setTextColor(selected ? hi : dim, black());
     display.drawString(buf, SCREEN_W / 2, top + i * rowH);
@@ -939,63 +941,91 @@ static void drawMenuDrive(Mode pending) {
   display.drawString("hold: toggle", SCREEN_W / 2, 106);
 }
 
-// --- Sensor capture (meter view's replacement for Auto test) -----------
-// Ten seconds of raw ADC sampling at ~1kHz, histogrammed over the full
-// 12-bit range, ending in an Otsu split: the threshold that best divides
-// the readings into two classes. That is *precisely* the number
-// LIGHT_THRESHOLD wants to be — the user flips the display between its
-// two test states while the capture runs (presses still send HID during
-// it, that's what flips the display) and the report hands back the
-// optimal cut plus each class's mean/spread, so the margin is visible
-// and not just asserted. Exists because a photovoltaic sensor's whole
-// swing is a few hundred counts: eyeballing the meter view was fine for
-// a 3000-count photoresistor, and is not fine any more.
+// --- Threshold calibration (meter view's replacement for Auto test) ----
+// Two labelled captures, SENSOR_CAPTURE_MS of ~1kHz raw ADC sampling
+// each: the user sets the display to one state before selecting the menu
+// item, the first capture runs, a prompt asks them to set the other
+// state and tap once, and the second capture runs. Labelling the two
+// sets beats clustering one mixed capture (the previous, Otsu-based
+// design): there is no mixture to unpick, and the threshold can be
+// placed dead-centre in the actually-measured gap between the sets, with
+// the margin reported as a number instead of inferred.
+//
+// The whole flow owns the button — menuState is MENU_CAPTURE throughout,
+// so no press during it is ever a HID send. That is deliberate and new
+// relative to the old design: the user arranges the display state
+// themselves between phases, and a press that also sent a click would
+// flip the very state they just set up.
 //
 // Sampling yields every iteration (vTaskDelay(1)), unlike the
 // measurement's tight poll — a 10s unyielding spin would trip the core-0
 // task watchdog at 5s, and level statistics don't need microsecond
 // cadence anyway.
-struct CaptureResult {
-  bool valid = false;
+struct CapSet {
   uint32_t n = 0;
   uint16_t minV = 0, maxV = 0;
-  int otsu = 0;             // suggested threshold: class0 <= otsu < class1
-  float mu0 = 0, sd0 = 0;   // the dimmer class
-  float mu1 = 0, sd1 = 0;   // the brighter class
-  uint32_t n0 = 0, n1 = 0;
-  float sep = 0;            // |mu1-mu0| / rms(sd) — how clean the split is
+  float mu = 0, sd = 0;
 };
-static CaptureResult capture;
+struct CalResult {
+  bool done = false;      // a calibration has run this boot
+  bool clean = false;     // the two sets don't overlap
+  CapSet dim, bright;     // ordered by mean, not by capture order
+  int thr = 0;            // suggested threshold
+  int margin = 0;         // counts of clear air each side of thr (clean only)
+  uint32_t overlap = 0;   // samples on the wrong side of thr (overlap only)
+};
+static CalResult cal;
 
-// 8KB, deliberately static: the UI task's stack has no room for it.
-static uint16_t capHist[4096];
+// One histogram per phase, deliberately static: 8KB each is nothing to
+// this chip's RAM but far too much for the UI task's stack.
+static uint16_t capHistA[4096];
+static uint16_t capHistB[4096];
 
-static void drawCaptureProgress(uint32_t elapsedMs, uint16_t curMin, uint16_t curMax) {
+static void drawCaptureProgress(int phase, uint32_t elapsedMs, uint16_t curMin, uint16_t curMax) {
   display.startWrite();
   display.fillScreen(black());
   display.setFont(&fonts::Font2);
   display.setTextDatum(textdatum_t::top_center);
   display.setTextColor(riseColor(), black());
-  char buf[24];
-  snprintf(buf, sizeof(buf), "CAPTURE %lus/%us",
+  char buf[28];
+  snprintf(buf, sizeof(buf), "CAPTURE %d/2  %lus/%us", phase,
            (unsigned long)(elapsedMs / 1000), (unsigned)(SENSOR_CAPTURE_MS / 1000));
   display.drawString(buf, SCREEN_W / 2, 20);
   display.setFont(&fonts::Font0);
   display.setTextColor(dimColor(), black());
   snprintf(buf, sizeof(buf), "seen %u - %u", curMin, curMax);
-  display.drawString(buf, SCREEN_W / 2, 48);
-  display.drawString("flip the display now:", SCREEN_W / 2, 70);
-  display.drawString("press = send input", SCREEN_W / 2, 82);
+  display.drawString(buf, SCREEN_W / 2, 52);
+  display.drawString("hold the display steady", SCREEN_W / 2, 76);
   display.endWrite();
 }
 
-static void runSensorCapture() {
-  memset(capHist, 0, sizeof(capHist));
-  capture = CaptureResult();
+static void drawCapturePrompt(const CapSet &first) {
+  display.startWrite();
+  display.fillScreen(black());
+  display.setFont(&fonts::Font2);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(display.color565(255, 190, 40), black());
+  display.drawString("CAPTURE 1 DONE", SCREEN_W / 2, 16);
+  display.setFont(&fonts::Font0);
+  display.setTextColor(dimColor(), black());
+  char buf[28];
+  snprintf(buf, sizeof(buf), "mean %.0f  range %u-%u", first.mu, first.minV, first.maxV);
+  display.drawString(buf, SCREEN_W / 2, 44);
+  display.drawString("switch the display to", SCREEN_W / 2, 66);
+  display.drawString("the OTHER state, then", SCREEN_W / 2, 78);
+  display.setTextColor(riseColor(), black());
+  display.drawString("tap: start capture 2", SCREEN_W / 2, 100);
+  display.endWrite();
+}
+
+// One phase: fill `hist`, summarise into `out`. Streaming min/max feed
+// the progress screen; mean/sd come off the histogram afterwards.
+static void capturePhase(int phase, uint16_t *hist, CapSet &out) {
+  memset(hist, 0, 4096 * sizeof(uint16_t));
   uint16_t mn = 4095, mx = 0;
   uint32_t n = 0;
   uint32_t start = millis(), lastDraw = 0;
-  drawCaptureProgress(0, 0, 0);  // immediately, not 500ms of stale menu
+  drawCaptureProgress(phase, 0, 0, 0);  // immediately, not 500ms late
 
   for (;;) {
     uint32_t elapsed = millis() - start;
@@ -1003,78 +1033,84 @@ static void runSensorCapture() {
     int v = analogRead(LIGHT_ANALOG_PIN);
     if (v < 0) v = 0;
     if (v > 4095) v = 4095;
-    capHist[v]++;
+    hist[v]++;
     n++;
     if (v < mn) mn = v;
     if (v > mx) mx = v;
     if (elapsed - lastDraw >= 500) {
       lastDraw = elapsed;
-      drawCaptureProgress(elapsed, mn, mx);
+      drawCaptureProgress(phase, elapsed, mn, mx);
     }
     vTaskDelay(1);  // yield: feeds the idle task, sets the ~1kHz cadence
   }
 
-  capture.n = n;
-  capture.minV = mn;
-  capture.maxV = mx;
-  if (n < 100 || mn == mx) return;  // nothing to split; capture.valid stays false
-
-  // Otsu: walk every possible cut, keep the one maximising between-class
-  // variance. Textbook form, on the full 4096-bin histogram.
-  uint64_t sumAll = 0;
-  for (int i = 0; i < 4096; i++) sumAll += (uint64_t)i * capHist[i];
-  // With two cleanly separated clusters the between-class variance is
-  // exactly constant across the empty gap between them (no term changes
-  // while the bins are zero), so the maximum is a plateau, not a point.
-  // Taking the plateau's FIRST point — what a plain `>` comparison does —
-  // parks the threshold right against the dimmer cluster's edge, ~3 sigma
-  // of margin one way and dozens the other, which is precisely the
-  // asymmetry this capture exists to avoid. The midpoint of the plateau
-  // is the centre of the gap: maximum margin to both classes. (Bitwise
-  // equality is sound here because nothing in the formula changes across
-  // zero bins; with overlapping classes the plateau is one point wide
-  // and this degrades to ordinary Otsu.)
-  uint32_t wB = 0;
-  uint64_t sumB = 0;
-  double best = -1.0;
-  int bestLo = mn, bestHi = mn;
-  for (int t = mn; t < mx; t++) {
-    wB += capHist[t];
-    if (wB == 0) continue;
-    uint32_t wF = n - wB;
-    if (wF == 0) break;
-    sumB += (uint64_t)t * capHist[t];
-    double mB = (double)sumB / wB;
-    double mF = (double)(sumAll - sumB) / wF;
-    double between = (double)wB * wF * (mB - mF) * (mB - mF);
-    if (between > best) { best = between; bestLo = bestHi = t; }
-    else if (between == best) { bestHi = t; }
+  out.n = n;
+  out.minV = mn;
+  out.maxV = mx;
+  double sum = 0, sq = 0;
+  for (int i = mn; i <= mx && n; i++) {
+    if (!hist[i]) continue;
+    sum += (double)hist[i] * i;
+    sq += (double)hist[i] * i * i;
   }
-  int bestT = (bestLo + bestHi) / 2;
-  capture.otsu = bestT;
-
-  // Per-class mean and spread, so the report shows the margin the cut
-  // actually has rather than just the cut.
-  double s0 = 0, s1 = 0, q0 = 0, q1 = 0;
-  uint32_t n0 = 0, n1 = 0;
-  for (int i = mn; i <= mx; i++) {
-    if (!capHist[i]) continue;
-    double c = capHist[i];
-    if (i <= bestT) { n0 += capHist[i]; s0 += c * i; q0 += c * i * i; }
-    else            { n1 += capHist[i]; s1 += c * i; q1 += c * i * i; }
+  if (n) {
+    out.mu = sum / n;
+    out.sd = sqrt(fmax(0.0, sq / n - out.mu * out.mu));
   }
-  capture.n0 = n0; capture.n1 = n1;
-  if (n0) { capture.mu0 = s0 / n0; capture.sd0 = sqrt(fmax(0.0, q0 / n0 - capture.mu0 * capture.mu0)); }
-  if (n1) { capture.mu1 = s1 / n1; capture.sd1 = sqrt(fmax(0.0, q1 / n1 - capture.mu1 * capture.mu1)); }
-  double rms = sqrt((capture.sd0 * capture.sd0 + capture.sd1 * capture.sd1) / 2.0);
-  capture.sep = rms > 0 ? (capture.mu1 - capture.mu0) / rms : 999;
-  capture.valid = (n0 > n / 50) && (n1 > n / 50);  // both states actually seen
 }
 
-// The capture's report. Suggested threshold big and amber; both class
-// levels with their spreads underneath, so "how much margin" is read
-// straight off the screen; a warning instead when the capture never saw
-// two distinguishable states.
+// The whole calibration, run linearly on the UI task from the menu's
+// select handler. Blocking in here is fine — this task owns the screen
+// and the sensor, and everything it would otherwise be doing is exactly
+// what this flow is doing. The inter-phase wait polls the tap request
+// flag that loop() (core 1) sets, which is also why the flags are
+// cleared before the wait: a tap queued during phase 1 must not start
+// phase 2 on its own.
+static void runThresholdCal() {
+  CapSet a, b;
+  capturePhase(1, capHistA, a);
+
+  drawCapturePrompt(a);
+  menuTapRequested = false;
+  menuSelectRequested = false;
+  while (!menuTapRequested && !menuSelectRequested) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+  menuTapRequested = false;
+  menuSelectRequested = false;
+
+  capturePhase(2, capHistB, b);
+
+  cal = CalResult();
+  cal.done = true;
+  const bool aDim = a.mu <= b.mu;
+  cal.dim = aDim ? a : b;
+  cal.bright = aDim ? b : a;
+  const uint16_t *dimHist = aDim ? capHistA : capHistB;
+  const uint16_t *brightHist = aDim ? capHistB : capHistA;
+
+  if (cal.bright.minV > cal.dim.maxV) {
+    // Clean gap: the threshold goes dead-centre in it, and the margin —
+    // the clear air between the threshold and the nearest sample either
+    // side — is the number that says how much room for error there is.
+    cal.clean = true;
+    cal.thr = (cal.dim.maxV + cal.bright.minV) / 2;
+    cal.margin = (cal.bright.minV - cal.dim.maxV) / 2;
+  } else {
+    // The sets overlap. Cut at the midpoint of the means and count the
+    // samples on the wrong side — an honest "this placement/sensor can't
+    // cleanly separate these two states" number, not a fake margin.
+    cal.clean = false;
+    cal.thr = (int)((cal.dim.mu + cal.bright.mu) / 2);
+    for (int i = cal.thr + 1; i < 4096; i++) cal.overlap += dimHist[i];
+    for (int i = 0; i <= cal.thr; i++) cal.overlap += brightHist[i];
+  }
+}
+
+// The calibration's report. Suggested threshold big and amber, both
+// sets' level and spread, and either the margin (clean) or the overlap
+// count (not) — so "how safe is this threshold" is a number on the
+// screen, not a feeling.
 static void drawCaptureResult() {
   uint16_t dim = dimColor();
   uint16_t amber = display.color565(255, 190, 40);
@@ -1084,38 +1120,34 @@ static void drawCaptureResult() {
   display.setFont(&fonts::Font0);
   display.setTextDatum(textdatum_t::top_center);
   display.setTextColor(dim, black());
-  display.drawString("SENSOR CAPTURE", SCREEN_W / 2, 4);
-  snprintf(buf, sizeof(buf), "n%lu  range %u-%u",
-           (unsigned long)capture.n, capture.minV, capture.maxV);
-  display.drawString(buf, SCREEN_W / 2, 16);
+  display.drawString("THRESHOLD CAL", SCREEN_W / 2, 4);
 
-  if (!capture.valid) {
-    display.setTextColor(warn, black());
-    display.drawString("no two-level split seen", SCREEN_W / 2, 46);
-    display.setTextColor(dim, black());
-    display.drawString("flip the display between", SCREEN_W / 2, 62);
-    display.drawString("dark and bright next time", SCREEN_W / 2, 74);
+  if (!cal.done) return;
+
+  display.setTextColor(amber, black());
+  display.setFont(&fonts::Font4);
+  snprintf(buf, sizeof(buf), "%d", cal.thr);
+  display.drawString(buf, SCREEN_W / 2, 22);
+
+  display.setFont(&fonts::Font0);
+  if (cal.clean) {
+    display.setTextColor(cal.margin >= 3 * (int)fmax(cal.dim.sd, cal.bright.sd) ? dim : warn, black());
+    snprintf(buf, sizeof(buf), "margin %d counts", cal.margin);
   } else {
-    display.setTextColor(amber, black());
-    display.setFont(&fonts::Font4);
-    snprintf(buf, sizeof(buf), "%d", capture.otsu);
-    display.drawString(buf, SCREEN_W / 2, 32);
-    display.setFont(&fonts::Font0);
-    display.setTextColor(dim, black());
-    display.drawString("suggested threshold", SCREEN_W / 2, 56);
-    snprintf(buf, sizeof(buf), "dark %.0f  sd%.1f  n%lu",
-             capture.mu0, capture.sd0, (unsigned long)capture.n0);
-    display.drawString(buf, SCREEN_W / 2, 70);
-    snprintf(buf, sizeof(buf), "brite %.0f  sd%.1f  n%lu",
-             capture.mu1, capture.sd1, (unsigned long)capture.n1);
-    display.drawString(buf, SCREEN_W / 2, 80);
-    snprintf(buf, sizeof(buf), "separation %.1fx  (now %d)",
-             capture.sep, lightThreshold);
-    display.setTextColor(capture.sep >= 4 ? dim : warn, black());
-    display.drawString(buf, SCREEN_W / 2, 90);
+    display.setTextColor(warn, black());
+    snprintf(buf, sizeof(buf), "OVERLAP: %lu wrong side", (unsigned long)cal.overlap);
   }
+  display.drawString(buf, SCREEN_W / 2, 48);
 
   display.setTextColor(dim, black());
+  snprintf(buf, sizeof(buf), "dark %.0f s%.1f %u-%u", cal.dim.mu, cal.dim.sd,
+           cal.dim.minV, cal.dim.maxV);
+  display.drawString(buf, SCREEN_W / 2, 64);
+  snprintf(buf, sizeof(buf), "brite %.0f s%.1f %u-%u", cal.bright.mu, cal.bright.sd,
+           cal.bright.minV, cal.bright.maxV);
+  display.drawString(buf, SCREEN_W / 2, 74);
+  snprintf(buf, sizeof(buf), "current threshold %d", lightThreshold);
+  display.drawString(buf, SCREEN_W / 2, 88);
   display.drawString("tap: done", SCREEN_W / 2, 112);
 }
 
@@ -1271,21 +1303,21 @@ static void uiTaskFn(void *) {
           // first press, so this hold can't leak into the data.
           case ITEM_AUTO:
             if (meterView) {
-              // The meter view's version of the auto test: capture the
-              // sensor itself instead of timing the display. The menu
-              // closes FIRST and menuState is volatile — so from the very
-              // next press edge, core 1 sees the menu shut and lets
-              // presses through as real HID sends, which is how the user
-              // flips the display's state mid-capture. Any measurement
-              // those presses queue up is discarded below: their t0 ages
-              // 10s during the capture, and servicing them afterwards
-              // would bank instant-timeout garbage into the stats.
-              menuState = MENU_NONE;
-              runSensorCapture();
-              measurePending = false;
-              measureBusy = false;
-              noLinkPress = false;
+              // The meter view's version of the auto test: calibrate the
+              // threshold from two labelled captures instead of timing
+              // the display. menuState goes to MENU_CAPTURE *before* the
+              // flow starts and stays there throughout — every press
+              // during it is menu input, never a HID send, because the
+              // user arranges the display state by hand between phases
+              // and a press that also clicked would flip the very state
+              // they just set up. runThresholdCal() blocks right here
+              // through both captures and the tap-to-continue between
+              // them; the stale-request clearing it does internally is
+              // what keeps a phase-1 tap from starting phase 2.
               menuState = MENU_CAPTURE;
+              runThresholdCal();
+              menuTapRequested = false;   // a tap queued during phase 2
+              menuSelectRequested = false; // must not dismiss the report
             } else {
               appStartAutoTest();
               menuState = MENU_NONE;

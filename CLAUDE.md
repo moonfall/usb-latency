@@ -953,25 +953,27 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   mode's bonds. Call-order trap: `setOwnAddr()` must precede
   `setOwnAddrType(BLE_OWN_ADDR_RANDOM)` — the latter validates that a
   random address is already installed.
-- **In the meter view, the Auto test menu slot runs a 10s sensor capture
-  instead (label changes to "Capture 10s"), and its suggested threshold
-  is plateau-midpoint Otsu, not plain Otsu.** The capture samples the raw
-  ADC at ~1kHz into a full 4096-bin histogram (static 8KB — the UI task's
-  stack has no room for it), yielding every sample via `vTaskDelay(1)` —
-  a 10s unyielding poll would trip the 5s core-0 watchdog, and level
-  statistics don't need the measurement loop's cadence. The menu closes
-  *before* the capture starts, so presses during it are real HID sends —
-  that's how the display gets flipped between its two states mid-capture
-  — and any measurement those presses queue is discarded at capture end
-  (their t0 aged 10s; servicing them would bank instant-timeout garbage).
-  The Otsu subtlety, caught by testing the math against synthetic data
-  before flashing anything: with cleanly separated clusters the
-  between-class variance is *exactly constant* across the empty gap, so
-  a `>` comparison picks the plateau's first point and parks the
-  threshold ~3σ from the dim cluster with dozens of σ to spare on the
-  other side. The fix takes the midpoint of the plateau (bitwise
-  float-equality is sound there — nothing in the formula changes across
-  zero-count bins), which is the centre of the gap: maximum margin both
-  ways. The report shows both class means with spreads and a separation
-  figure (orange below 4×); the result screen is a MenuState
-  (`MENU_CAPTURE`) so the dismissing tap can't double as a HID press.
+- **In the meter view, the Auto test menu slot runs a two-phase threshold
+  calibration instead (label: "Find threshold").** Two labelled 10s
+  captures (`SENSOR_CAPTURE_MS` each, ~1kHz raw ADC into a static 4096-bin
+  histogram per phase — 8KB each, far too big for the UI task's stack):
+  the user sets the display to one state before selecting, capture 1
+  runs, a prompt asks for the other state and a tap, capture 2 runs. The
+  suggested threshold is the dead centre of the measured gap between the
+  two sets, with the margin (counts of clear air each side) reported
+  next to it — or, when the sets overlap, an honest wrong-side sample
+  count instead of a fake margin. This replaced a single-capture Otsu
+  design within a day of it landing: labelling the sets beats clustering
+  a mixture, and the margin becomes a measurement rather than an
+  inference. Design points that matter: `menuState` is `MENU_CAPTURE`
+  for the *whole* flow, so no press during it is ever a HID send — the
+  user arranges the display state by hand between phases, and a press
+  that also clicked would flip the state they just set up (the opposite
+  choice from the old design, which relied on presses flipping the
+  display mid-capture). `runThresholdCal()` blocks on the UI task
+  through both captures and the inter-phase wait, polling the tap
+  request flag that core 1 sets; the request flags are cleared before
+  the wait and again after the flow, so a tap queued during either
+  capture can neither start phase 2 early nor dismiss the report
+  unread. Sampling yields every iteration (`vTaskDelay(1)`) — a 10s
+  unyielding poll would trip the 5s core-0 watchdog.
