@@ -227,17 +227,18 @@
   }
 
   // One shared bin layout for every histogram, so the three charts sit on
-  // the same x axis and can be compared by eye. Bin count via
-  // Freedman–Diaconis on the pooled data, clamped to something readable.
-  function binLayout(allStats) {
+  // the same x axis and can be compared by eye. Bin count is driven by
+  // the rendered width — about 2px per bar, as fine as the screen can
+  // usefully draw — rather than a statistics-textbook rule like
+  // Freedman-Diaconis (tried first; its bins were far too coarse to show
+  // the frame-interval structure these distributions actually have).
+  // With a few hundred samples spread over hundreds of bins, most bins
+  // hold 0-3 counts and the picture is spiky; that's the point — vsync
+  // combs and mode splits live in exactly that fine structure.
+  function binLayout(allStats, canvasWidth) {
     const s = allStats;
     const span = s.max - s.min || 1;
-    let bins = 60;
-    const iqr = s.p ? null : null; // FD below uses quartiles from sorted
-    const q1 = percentile(s.sorted, 25), q3 = percentile(s.sorted, 75);
-    const fdWidth = 2 * (q3 - q1) / Math.cbrt(s.n);
-    if (fdWidth > 0) bins = Math.round(span / fdWidth);
-    bins = Math.max(10, Math.min(120, bins || 60));
+    const bins = Math.max(120, Math.min(600, Math.round(canvasWidth / 2)));
     return { min: s.min, span, bins };
   }
 
@@ -273,7 +274,9 @@
         const bh = (counts[si][b] / maxTotal) * (h - padB - padT);
         if (bh > 0) {
           ctx.fillStyle = ser.color;
-          ctx.fillRect(b * barW + 0.5, y - bh, Math.max(1, barW - 1), bh);
+          // A 1px gap between bars only when bars are wide enough to
+          // spare it — at ~2px per bar the gap would eat half the ink.
+          ctx.fillRect(b * barW, y - bh, barW >= 4 ? barW - 1 : barW, bh);
           y -= bh;
         }
       });
@@ -332,7 +335,6 @@
     const sAll = computeStats(okAll.map(s => s.latencyUs), toAll.length);
     const sRise = computeStats(rise, toAll.filter(s => s.rise).length);
     const sFall = computeStats(fall, toAll.filter(s => !s.rise).length);
-    const layout = sAll.n ? binLayout(sAll) : null;
 
     const cssRise = getComputedStyle(document.documentElement).getPropertyValue("--rise").trim();
     const cssFall = getComputedStyle(document.documentElement).getPropertyValue("--fall").trim();
@@ -360,7 +362,10 @@
         <canvas></canvas><div class="hist-note"></div>
       </div>`;
 
-    if (!layout) return;
+    if (!sAll.n) return;
+    // Bin count follows the rendered width, so the canvases must exist
+    // (and have laid out) before the shared layout can be computed.
+    const layout = binLayout(sAll, document.querySelector("#sec-all canvas").clientWidth || 1000);
     const draw = (sel, series) => {
       const sec = document.querySelector(sel);
       drawHistogram(sec.querySelector("canvas"), sec.querySelector(".hist-note"), layout, series);
