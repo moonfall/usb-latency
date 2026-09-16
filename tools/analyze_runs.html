@@ -93,6 +93,29 @@
   canvas { width: 100%; height: 190px; display: block; border-radius: 6px; background: var(--panel2); }
   .hist-note { color: var(--dim); font-size: 11px; margin-top: 6px; min-height: 14px; }
   #empty { color: var(--dim); text-align: center; padding: 30px 0; }
+
+  #controls {
+    display: none;
+    align-items: center;
+    gap: 10px;
+    background: var(--panel);
+    border-radius: 8px;
+    padding: 8px 14px;
+    margin-bottom: 16px;
+    font-size: 12px;
+    color: var(--dim);
+  }
+  #controls.show { display: flex; }
+  #controls input[type=range] { flex: 0 1 320px; accent-color: var(--accent); }
+  #binsVal { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3ch; }
+
+  .filecard label { display: flex; align-items: center; gap: 10px; cursor: pointer; }
+  .filecard input[type=checkbox] { accent-color: var(--accent); margin: 0; }
+  .filecard.off { opacity: 0.45; }
+
+  /* Whole page is the drop target; the dashed zone stays as the visual
+     affordance and the click-to-choose surface. */
+  body.dragging #drop { border-color: var(--accent); background: var(--panel); color: var(--text); }
 </style>
 </head>
 <body>
@@ -100,10 +123,15 @@
 <div class="sub">Drop <code>RUNnnnnn.CSV</code> files from the device's USB-drive mode. All loaded files are pooled; timings shown in milliseconds.</div>
 
 <div id="drop">
-  Drop CSV files here — or click to choose
+  Drop CSV files anywhere on this page — or click to choose
   <input type="file" id="picker" multiple accept=".csv,text/csv">
 </div>
 <div id="files"></div>
+<div id="controls">
+  <label for="bins">Bins</label>
+  <input type="range" id="bins" min="20" max="600" step="5" value="80">
+  <span id="binsVal">80</span>
+</div>
 <div id="out"><div id="empty">No data loaded yet.</div></div>
 
 <script>
@@ -155,9 +183,9 @@
     }
 
     if (!sawHeader || samples.length === 0) {
-      return { name, meta, samples: [], error: "not a run CSV (no data rows found)" };
+      return { name, meta, samples: [], error: "not a run CSV (no data rows found)", active: true };
     }
-    return { name, meta, samples, error: null };
+    return { name, meta, samples, error: null, active: true };
   }
 
   // ---- statistics ------------------------------------------------------
@@ -226,19 +254,16 @@
     return cells.join("");
   }
 
-  // One shared bin layout for every histogram, so the three charts sit on
-  // the same x axis and can be compared by eye. Bin count is driven by
-  // the rendered width — about 2px per bar, as fine as the screen can
-  // usefully draw — rather than a statistics-textbook rule like
-  // Freedman-Diaconis (tried first; its bins were far too coarse to show
-  // the frame-interval structure these distributions actually have).
-  // With a few hundred samples spread over hundreds of bins, most bins
-  // hold 0-3 counts and the picture is spiky; that's the point — vsync
-  // combs and mode splits live in exactly that fine structure.
-  function binLayout(allStats, canvasWidth) {
+  // One shared bin layout for every histogram, so every chart on the page
+  // sits on the same x axis and can be compared by eye. Bin count comes
+  // from the slider (default 80) — a statistics-textbook rule like
+  // Freedman-Diaconis was tried first and chose bins far too coarse to
+  // show the frame-interval structure these distributions actually have,
+  // and a fixed fine grain suits some datasets but drowns sparse ones.
+  // The right resolution depends on what's being hunted, so it's a knob.
+  function binLayout(allStats, bins) {
     const s = allStats;
     const span = s.max - s.min || 1;
-    const bins = Math.max(120, Math.min(600, Math.round(canvasWidth / 2)));
     return { min: s.min, span, bins };
   }
 
@@ -299,7 +324,7 @@
       const lo = layout.min + (layout.span * b) / layout.bins;
       const hi = layout.min + (layout.span * (b + 1)) / layout.bins;
       const parts = series.map((ser, si) => counts[si][b]);
-      note.textContent = `bin ${b + 1}/${layout.bins}: ${ms(lo)}–${ms(hi)} ms — ` +
+      note.textContent = `bin ${b + 1}/${layout.bins}: ${ms(lo)}\u2013${ms(hi)} ms \u2014 ` +
         (parts.length === 2 ? `rise ${parts[1]}, fall ${parts[0]}` : `count ${parts[0]}`);
     };
     canvas.onmouseleave = () => { note.textContent = ""; };
@@ -311,70 +336,112 @@
       const m = f.meta;
       const info = f.error
         ? `<span class="parseerr">${f.error}</span>`
-        : `<span class="meta">run ${m.run ?? "?"} · ${m.mode ?? "?"} · ` +
-          `${f.samples.length} rows${m.aborted ? ` · <span class="aborted">aborted</span>` : ""}</span>`;
-      return `<div class="filecard"><b>${f.name}</b>${info}` +
-             `<button data-i="${i}" title="remove">✕</button></div>`;
+        : `<span class="meta">run ${m.run ?? "?"} \u00b7 ${m.mode ?? "?"} \u00b7 ` +
+          `${f.samples.length} rows${m.aborted ? ` \u00b7 <span class="aborted">aborted</span>` : ""}</span>`;
+      // The checkbox toggles the dataset in and out of every panel below;
+      // the cross still removes it outright.
+      return `<div class="filecard${f.active ? "" : " off"}">` +
+             `<label><input type="checkbox" data-i="${i}"${f.active ? " checked" : ""}` +
+             `${f.error ? " disabled" : ""}><b>${f.name}</b>${info}</label>` +
+             `<button data-i="${i}" title="remove">\u2715</button></div>`;
     }).join("");
     filesDiv.querySelectorAll("button").forEach(btn => {
       btn.onclick = () => { files.splice(+btn.dataset.i, 1); render(); };
     });
+    filesDiv.querySelectorAll("input[type=checkbox]").forEach(cb => {
+      cb.onchange = () => { files[+cb.dataset.i].active = cb.checked; render(); };
+    });
+
+    const activeFiles = files.filter(f => !f.error && f.active);
+    // Every sample tagged with its file's mode, so the breakouts below
+    // can slice the pool by transport and by device kind.
+    const all = activeFiles.flatMap(f =>
+      f.samples.map(x => ({ ...x, mode: f.meta.mode || "?" })));
 
     const out = document.getElementById("out");
-    const all = files.flatMap(f => f.samples);
+    const controls = document.getElementById("controls");
     if (all.length === 0) {
-      out.innerHTML = `<div id="empty">No data loaded yet.</div>`;
+      controls.classList.remove("show");
+      out.innerHTML = `<div id="empty">${files.length ? "All datasets are toggled off." : "No data loaded yet."}</div>`;
       return;
     }
+    controls.classList.add("show");
 
-    const okAll = all.filter(s => s.latencyUs !== null);
-    const rise = okAll.filter(s => s.rise).map(s => s.latencyUs);
-    const fall = okAll.filter(s => !s.rise).map(s => s.latencyUs);
-    const toAll = all.filter(s => s.latencyUs === null);
-
-    const sAll = computeStats(okAll.map(s => s.latencyUs), toAll.length);
-    const sRise = computeStats(rise, toAll.filter(s => s.rise).length);
-    const sFall = computeStats(fall, toAll.filter(s => !s.rise).length);
+    const okAll = all.filter(x => x.latencyUs !== null);
+    const toAll = all.filter(x => x.latencyUs === null);
+    const sAll = computeStats(okAll.map(x => x.latencyUs), toAll.length);
 
     const cssRise = getComputedStyle(document.documentElement).getPropertyValue("--rise").trim();
     const cssFall = getComputedStyle(document.documentElement).getPropertyValue("--fall").trim();
 
-    const modes = [...new Set(files.filter(f => !f.error).map(f => f.meta.mode).filter(Boolean))];
-    const modeNote = modes.length > 1
-      ? ` — <span style="color:var(--warn)">mixing modes: ${modes.join(", ")}</span>`
-      : modes.length === 1 ? ` — ${modes[0]}` : "";
+    // A section = stats grid + one stacked rise/fall histogram over an
+    // arbitrary slice of the pool. All/Rising/Falling and every breakout
+    // render through this one path so they can't drift apart.
+    const sections = [];
+    const pendingDraws = [];
+    function addSection(id, cls, title, subtitle, subset) {
+      const ok = subset.filter(x => x.latencyUs !== null);
+      const rise = ok.filter(x => x.rise).map(x => x.latencyUs);
+      const fall = ok.filter(x => !x.rise).map(x => x.latencyUs);
+      const timeouts = subset.filter(x => x.latencyUs === null).length;
+      const stats = computeStats(ok.map(x => x.latencyUs), timeouts);
+      sections.push(
+        `<div class="section ${cls}" id="${id}">` +
+        `<h2>${title}</h2><div class="count">${subtitle}</div>` +
+        `<div class="stats">${statCells(stats)}</div>` +
+        `<canvas></canvas><div class="hist-note"></div></div>`);
+      const series = [];
+      if (fall.length) series.push({ values: fall, color: cssFall });
+      if (rise.length) series.push({ values: rise, color: cssRise });
+      pendingDraws.push({ id, series });
+    }
 
-    out.innerHTML = `
-      <div class="section" id="sec-all">
-        <h2>All readings</h2>
-        <div class="count">${files.filter(f => !f.error).length} file(s)${modeNote}</div>
-        <div class="stats">${statCells(sAll)}</div>
-        <canvas></canvas><div class="hist-note"></div>
-      </div>
-      <div class="section rise" id="sec-rise">
-        <h2>Rising</h2><div class="count">sensor crossed the threshold upward</div>
-        <div class="stats">${statCells(sRise)}</div>
-        <canvas></canvas><div class="hist-note"></div>
-      </div>
-      <div class="section fall" id="sec-fall">
-        <h2>Falling</h2><div class="count">sensor crossed the threshold downward</div>
-        <div class="stats">${statCells(sFall)}</div>
-        <canvas></canvas><div class="hist-note"></div>
-      </div>`;
+    const modes = [...new Set(activeFiles.map(f => f.meta.mode).filter(Boolean))];
+    const modeNote = modes.length > 1
+      ? ` \u2014 <span style="color:var(--warn)">mixing modes: ${modes.join(", ")}</span>`
+      : modes.length === 1 ? ` \u2014 ${modes[0]}` : "";
+
+    addSection("sec-all", "", "All readings",
+      `${activeFiles.length} dataset(s)${modeNote}`, all);
+    addSection("sec-rise", "rise", "Rising",
+      "sensor crossed the threshold upward", all.filter(x => x.rise));
+    addSection("sec-fall", "fall", "Falling",
+      "sensor crossed the threshold downward", all.filter(x => !x.rise));
+
+    // Breakouts: by transport and by device kind, derived from each
+    // file's mode string ("GAMEPAD", "BLE KEYBOARD", ...). A breakout
+    // only appears when it would show something the All panel doesn't —
+    // i.e. it is a proper, non-empty subset of the active pool.
+    const breakouts = [
+      ["bo-usb", "All USB", "every USB mode pooled", m => !m.startsWith("BLE")],
+      ["bo-bt", "All Bluetooth", "every BLE mode pooled", m => m.startsWith("BLE")],
+      ["bo-gamepad", "Gamepad", "USB + BLE gamepad pooled", m => m.includes("GAMEPAD")],
+      ["bo-keyboard", "Keyboard", "USB + BLE keyboard pooled", m => m.includes("KEYBOARD")],
+      ["bo-mouse", "Mouse", "USB + BLE mouse pooled", m => m.includes("MOUSE")],
+    ];
+    let breakoutHeaderAdded = false;
+    for (const [id, title, subtitle, test] of breakouts) {
+      const subset = all.filter(x => test(x.mode));
+      if (subset.length === 0 || subset.length === all.length) continue;
+      if (!breakoutHeaderAdded) {
+        sections.push(`<h1 style="font-size:16px;margin:26px 0 10px">Breakouts</h1>`);
+        breakoutHeaderAdded = true;
+      }
+      addSection(id, "", title, subtitle, subset);
+    }
+
+    out.innerHTML = sections.join("");
 
     if (!sAll.n) return;
-    // Bin count follows the rendered width, so the canvases must exist
-    // (and have laid out) before the shared layout can be computed.
-    const layout = binLayout(sAll, document.querySelector("#sec-all canvas").clientWidth || 1000);
-    const draw = (sel, series) => {
-      const sec = document.querySelector(sel);
-      drawHistogram(sec.querySelector("canvas"), sec.querySelector(".hist-note"), layout, series);
-    };
-    // Stacked on the All chart: fall from the baseline, rise on top —
-    // same convention as the device's on-screen histogram.
-    draw("#sec-all", [{ values: fall, color: cssFall }, { values: rise, color: cssRise }]);
-    draw("#sec-rise", [{ values: rise, color: cssRise }]);
-    draw("#sec-fall", [{ values: fall, color: cssFall }]);
+    // One layout for every chart on the page — same axis, same bins, so
+    // a hump in any breakout lines up under the same latency in All.
+    const layout = binLayout(sAll, +document.getElementById("bins").value);
+    for (const d of pendingDraws) {
+      const sec = document.getElementById(d.id);
+      if (!d.series.length) continue;  // stats-only section (all timeouts)
+      drawHistogram(sec.querySelector("canvas"), sec.querySelector(".hist-note"),
+                    layout, d.series);
+    }
   }
 
   // Redraw on resize so canvas backing stores stay sharp.
@@ -391,9 +458,12 @@
     Promise.all(readers).then(parsed => {
       // Replace an already-loaded file of the same name rather than
       // duplicating it — re-dropping a folder shouldn't double the data.
+      // A replaced file keeps its toggle state; being re-dropped is not
+      // a request to unhide it.
       for (const p of parsed) {
         const i = files.findIndex(f => f.name === p.name);
-        if (i >= 0) files[i] = p; else files.push(p);
+        if (i >= 0) { p.active = files[i].active; files[i] = p; }
+        else files.push(p);
       }
       files.sort((a, b) => a.name.localeCompare(b.name));
       render();
@@ -404,13 +474,32 @@
   const picker = document.getElementById("picker");
   drop.onclick = () => picker.click();
   picker.onchange = () => { addFiles(picker.files); picker.value = ""; };
-  drop.ondragover = e => { e.preventDefault(); drop.classList.add("hover"); };
-  drop.ondragleave = () => drop.classList.remove("hover");
-  drop.ondrop = e => {
+
+  // The whole page is the drop target — aiming for one box is busywork.
+  // dragenter/dragleave fire for every child crossed, so track depth
+  // rather than trusting any single leave event.
+  let dragDepth = 0;
+  window.addEventListener("dragenter", e => {
     e.preventDefault();
-    drop.classList.remove("hover");
-    addFiles(e.dataTransfer.files);
-  };
+    if (++dragDepth === 1) document.body.classList.add("dragging");
+  });
+  window.addEventListener("dragleave", () => {
+    if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove("dragging"); }
+  });
+  window.addEventListener("dragover", e => e.preventDefault());
+  window.addEventListener("drop", e => {
+    e.preventDefault();
+    dragDepth = 0;
+    document.body.classList.remove("dragging");
+    if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+  });
+
+  const binsSlider = document.getElementById("bins");
+  const binsVal = document.getElementById("binsVal");
+  binsSlider.addEventListener("input", () => {
+    binsVal.textContent = binsSlider.value;
+    render();
+  });
 })();
 </script>
 </body>
