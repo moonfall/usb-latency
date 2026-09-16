@@ -226,6 +226,13 @@ static const int LIGHT_DEADBAND = 8;          // counts of ADC noise not worth a
 #endif
 static const int lightThreshold = LIGHT_THRESHOLD;
 
+// How long the meter view's sensor capture samples for (see
+// runSensorCapture()). Unlike the measurement poll below this loop
+// yields every sample, so it is not watchdog-bound and 10s is fine.
+#ifndef SENSOR_CAPTURE_MS
+#define SENSOR_CAPTURE_MS 10000
+#endif
+
 // How long to wait for the display to respond before giving up. Also the
 // longest this task can hold core 0 without letting its idle task run —
 // keep it well under the 5s task watchdog.
@@ -334,7 +341,10 @@ static volatile uint16_t autoTotal = 0;
 // the point — it makes boardMenuActive() true for that whole boot, which
 // is what keeps every press away from the HID/measurement path without
 // main.cpp knowing storage exists. See the file header.
-enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE };
+// MENU_CAPTURE is the sensor capture's results screen — a menu state for
+// the same reason MENU_DRIVE is one: while it is up, boardMenuActive()
+// keeps the dismissing tap from also being a HID press.
+enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE, MENU_CAPTURE };
 static volatile MenuState menuState = MENU_NONE;
 static int topIndex = 0;
 
@@ -802,7 +812,11 @@ static void drawMenuTop() {
   char buf[24];
   for (int i = 0; i < numTopItems; i++) {
     bool selected = (i == topIndex);
-    snprintf(buf, sizeof(buf), selected ? "> %s" : "%s", TOP_ITEM_LABELS[topItems[i]]);
+    const char *label = TOP_ITEM_LABELS[topItems[i]];
+    // In the meter view the Auto test slot runs the sensor capture
+    // instead (see the select handler), so it says so.
+    if (topItems[i] == ITEM_AUTO && meterView) label = "Capture 10s";
+    snprintf(buf, sizeof(buf), selected ? "> %s" : "%s", label);
     display.setTextColor(selected ? hi : dim, black());
     display.drawString(buf, SCREEN_W / 2, top + i * rowH);
   }
@@ -925,6 +939,186 @@ static void drawMenuDrive(Mode pending) {
   display.drawString("hold: toggle", SCREEN_W / 2, 106);
 }
 
+// --- Sensor capture (meter view's replacement for Auto test) -----------
+// Ten seconds of raw ADC sampling at ~1kHz, histogrammed over the full
+// 12-bit range, ending in an Otsu split: the threshold that best divides
+// the readings into two classes. That is *precisely* the number
+// LIGHT_THRESHOLD wants to be — the user flips the display between its
+// two test states while the capture runs (presses still send HID during
+// it, that's what flips the display) and the report hands back the
+// optimal cut plus each class's mean/spread, so the margin is visible
+// and not just asserted. Exists because a photovoltaic sensor's whole
+// swing is a few hundred counts: eyeballing the meter view was fine for
+// a 3000-count photoresistor, and is not fine any more.
+//
+// Sampling yields every iteration (vTaskDelay(1)), unlike the
+// measurement's tight poll — a 10s unyielding spin would trip the core-0
+// task watchdog at 5s, and level statistics don't need microsecond
+// cadence anyway.
+struct CaptureResult {
+  bool valid = false;
+  uint32_t n = 0;
+  uint16_t minV = 0, maxV = 0;
+  int otsu = 0;             // suggested threshold: class0 <= otsu < class1
+  float mu0 = 0, sd0 = 0;   // the dimmer class
+  float mu1 = 0, sd1 = 0;   // the brighter class
+  uint32_t n0 = 0, n1 = 0;
+  float sep = 0;            // |mu1-mu0| / rms(sd) — how clean the split is
+};
+static CaptureResult capture;
+
+// 8KB, deliberately static: the UI task's stack has no room for it.
+static uint16_t capHist[4096];
+
+static void drawCaptureProgress(uint32_t elapsedMs, uint16_t curMin, uint16_t curMax) {
+  display.startWrite();
+  display.fillScreen(black());
+  display.setFont(&fonts::Font2);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(riseColor(), black());
+  char buf[24];
+  snprintf(buf, sizeof(buf), "CAPTURE %lus/%us",
+           (unsigned long)(elapsedMs / 1000), (unsigned)(SENSOR_CAPTURE_MS / 1000));
+  display.drawString(buf, SCREEN_W / 2, 20);
+  display.setFont(&fonts::Font0);
+  display.setTextColor(dimColor(), black());
+  snprintf(buf, sizeof(buf), "seen %u - %u", curMin, curMax);
+  display.drawString(buf, SCREEN_W / 2, 48);
+  display.drawString("flip the display now:", SCREEN_W / 2, 70);
+  display.drawString("press = send input", SCREEN_W / 2, 82);
+  display.endWrite();
+}
+
+static void runSensorCapture() {
+  memset(capHist, 0, sizeof(capHist));
+  capture = CaptureResult();
+  uint16_t mn = 4095, mx = 0;
+  uint32_t n = 0;
+  uint32_t start = millis(), lastDraw = 0;
+  drawCaptureProgress(0, 0, 0);  // immediately, not 500ms of stale menu
+
+  for (;;) {
+    uint32_t elapsed = millis() - start;
+    if (elapsed >= SENSOR_CAPTURE_MS) break;
+    int v = analogRead(LIGHT_ANALOG_PIN);
+    if (v < 0) v = 0;
+    if (v > 4095) v = 4095;
+    capHist[v]++;
+    n++;
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    if (elapsed - lastDraw >= 500) {
+      lastDraw = elapsed;
+      drawCaptureProgress(elapsed, mn, mx);
+    }
+    vTaskDelay(1);  // yield: feeds the idle task, sets the ~1kHz cadence
+  }
+
+  capture.n = n;
+  capture.minV = mn;
+  capture.maxV = mx;
+  if (n < 100 || mn == mx) return;  // nothing to split; capture.valid stays false
+
+  // Otsu: walk every possible cut, keep the one maximising between-class
+  // variance. Textbook form, on the full 4096-bin histogram.
+  uint64_t sumAll = 0;
+  for (int i = 0; i < 4096; i++) sumAll += (uint64_t)i * capHist[i];
+  // With two cleanly separated clusters the between-class variance is
+  // exactly constant across the empty gap between them (no term changes
+  // while the bins are zero), so the maximum is a plateau, not a point.
+  // Taking the plateau's FIRST point — what a plain `>` comparison does —
+  // parks the threshold right against the dimmer cluster's edge, ~3 sigma
+  // of margin one way and dozens the other, which is precisely the
+  // asymmetry this capture exists to avoid. The midpoint of the plateau
+  // is the centre of the gap: maximum margin to both classes. (Bitwise
+  // equality is sound here because nothing in the formula changes across
+  // zero bins; with overlapping classes the plateau is one point wide
+  // and this degrades to ordinary Otsu.)
+  uint32_t wB = 0;
+  uint64_t sumB = 0;
+  double best = -1.0;
+  int bestLo = mn, bestHi = mn;
+  for (int t = mn; t < mx; t++) {
+    wB += capHist[t];
+    if (wB == 0) continue;
+    uint32_t wF = n - wB;
+    if (wF == 0) break;
+    sumB += (uint64_t)t * capHist[t];
+    double mB = (double)sumB / wB;
+    double mF = (double)(sumAll - sumB) / wF;
+    double between = (double)wB * wF * (mB - mF) * (mB - mF);
+    if (between > best) { best = between; bestLo = bestHi = t; }
+    else if (between == best) { bestHi = t; }
+  }
+  int bestT = (bestLo + bestHi) / 2;
+  capture.otsu = bestT;
+
+  // Per-class mean and spread, so the report shows the margin the cut
+  // actually has rather than just the cut.
+  double s0 = 0, s1 = 0, q0 = 0, q1 = 0;
+  uint32_t n0 = 0, n1 = 0;
+  for (int i = mn; i <= mx; i++) {
+    if (!capHist[i]) continue;
+    double c = capHist[i];
+    if (i <= bestT) { n0 += capHist[i]; s0 += c * i; q0 += c * i * i; }
+    else            { n1 += capHist[i]; s1 += c * i; q1 += c * i * i; }
+  }
+  capture.n0 = n0; capture.n1 = n1;
+  if (n0) { capture.mu0 = s0 / n0; capture.sd0 = sqrt(fmax(0.0, q0 / n0 - capture.mu0 * capture.mu0)); }
+  if (n1) { capture.mu1 = s1 / n1; capture.sd1 = sqrt(fmax(0.0, q1 / n1 - capture.mu1 * capture.mu1)); }
+  double rms = sqrt((capture.sd0 * capture.sd0 + capture.sd1 * capture.sd1) / 2.0);
+  capture.sep = rms > 0 ? (capture.mu1 - capture.mu0) / rms : 999;
+  capture.valid = (n0 > n / 50) && (n1 > n / 50);  // both states actually seen
+}
+
+// The capture's report. Suggested threshold big and amber; both class
+// levels with their spreads underneath, so "how much margin" is read
+// straight off the screen; a warning instead when the capture never saw
+// two distinguishable states.
+static void drawCaptureResult() {
+  uint16_t dim = dimColor();
+  uint16_t amber = display.color565(255, 190, 40);
+  uint16_t warn = display.color565(255, 140, 60);
+  char buf[32];
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  display.drawString("SENSOR CAPTURE", SCREEN_W / 2, 4);
+  snprintf(buf, sizeof(buf), "n%lu  range %u-%u",
+           (unsigned long)capture.n, capture.minV, capture.maxV);
+  display.drawString(buf, SCREEN_W / 2, 16);
+
+  if (!capture.valid) {
+    display.setTextColor(warn, black());
+    display.drawString("no two-level split seen", SCREEN_W / 2, 46);
+    display.setTextColor(dim, black());
+    display.drawString("flip the display between", SCREEN_W / 2, 62);
+    display.drawString("dark and bright next time", SCREEN_W / 2, 74);
+  } else {
+    display.setTextColor(amber, black());
+    display.setFont(&fonts::Font4);
+    snprintf(buf, sizeof(buf), "%d", capture.otsu);
+    display.drawString(buf, SCREEN_W / 2, 32);
+    display.setFont(&fonts::Font0);
+    display.setTextColor(dim, black());
+    display.drawString("suggested threshold", SCREEN_W / 2, 56);
+    snprintf(buf, sizeof(buf), "dark %.0f  sd%.1f  n%lu",
+             capture.mu0, capture.sd0, (unsigned long)capture.n0);
+    display.drawString(buf, SCREEN_W / 2, 70);
+    snprintf(buf, sizeof(buf), "brite %.0f  sd%.1f  n%lu",
+             capture.mu1, capture.sd1, (unsigned long)capture.n1);
+    display.drawString(buf, SCREEN_W / 2, 80);
+    snprintf(buf, sizeof(buf), "separation %.1fx  (now %d)",
+             capture.sep, lightThreshold);
+    display.setTextColor(capture.sep >= 4 ? dim : warn, black());
+    display.drawString(buf, SCREEN_W / 2, 90);
+  }
+
+  display.setTextColor(dim, black());
+  display.drawString("tap: done", SCREEN_W / 2, 112);
+}
+
 static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung hint,
                       LinkState link) {
   display.startWrite();
@@ -938,6 +1132,8 @@ static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung 
     drawMenuStorage(pending);
   } else if (menuState == MENU_DRIVE) {
     drawMenuDrive(pending);
+  } else if (menuState == MENU_CAPTURE) {
+    drawCaptureResult();
   } else {
     drawTopStrip(raw, mv);
     drawModeLine(active, link);
@@ -1058,6 +1254,9 @@ static void uiTaskFn(void *) {
         // so the hold that follows is only ever "I'm done looking".
         appSetStorageArmed(!appStorageArmed());
       }
+      else if (menuState == MENU_CAPTURE) {
+        menuState = MENU_NONE;  // the report has one job: be read, then leave
+      }
       // MENU_DRIVE deliberately ignores taps: a stray brush of the screen
       // face while the host is copying files must not change what the
       // next reset does. Only the 1s hold below counts there.
@@ -1070,7 +1269,28 @@ static void uiTaskFn(void *) {
           // Close the menu on the way out so the run is visible as it
           // goes; main.cpp waits for the button to come up before its
           // first press, so this hold can't leak into the data.
-          case ITEM_AUTO:  appStartAutoTest(); menuState = MENU_NONE; break;
+          case ITEM_AUTO:
+            if (meterView) {
+              // The meter view's version of the auto test: capture the
+              // sensor itself instead of timing the display. The menu
+              // closes FIRST and menuState is volatile — so from the very
+              // next press edge, core 1 sees the menu shut and lets
+              // presses through as real HID sends, which is how the user
+              // flips the display's state mid-capture. Any measurement
+              // those presses queue up is discarded below: their t0 ages
+              // 10s during the capture, and servicing them afterwards
+              // would bank instant-timeout garbage into the stats.
+              menuState = MENU_NONE;
+              runSensorCapture();
+              measurePending = false;
+              measureBusy = false;
+              noLinkPress = false;
+              menuState = MENU_CAPTURE;
+            } else {
+              appStartAutoTest();
+              menuState = MENU_NONE;
+            }
+            break;
           case ITEM_DRIVE: menuState = MENU_STORAGE; break;
           case ITEM_MODE:  menuState = MENU_MODE; break;
           // Pairing has no picker of its own and nothing to confirm: it
@@ -1085,8 +1305,10 @@ static void uiTaskFn(void *) {
           case ITEM_EXIT:  menuState = MENU_NONE; break;
           default: break;
         }
-      } else if (menuState == MENU_MODE || menuState == MENU_STORAGE) {
-        // Both pickers persist per tap — nothing to do here but leave.
+      } else if (menuState == MENU_MODE || menuState == MENU_STORAGE ||
+                 menuState == MENU_CAPTURE) {
+        // The pickers persist per tap and the capture report is only a
+        // report — in all three, a hold just leaves.
         menuState = MENU_NONE;
       } else if (menuState == MENU_DRIVE) {
         // The only gesture a storage boot has. It cannot change what the

@@ -953,3 +953,25 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   mode's bonds. Call-order trap: `setOwnAddr()` must precede
   `setOwnAddrType(BLE_OWN_ADDR_RANDOM)` — the latter validates that a
   random address is already installed.
+- **In the meter view, the Auto test menu slot runs a 10s sensor capture
+  instead (label changes to "Capture 10s"), and its suggested threshold
+  is plateau-midpoint Otsu, not plain Otsu.** The capture samples the raw
+  ADC at ~1kHz into a full 4096-bin histogram (static 8KB — the UI task's
+  stack has no room for it), yielding every sample via `vTaskDelay(1)` —
+  a 10s unyielding poll would trip the 5s core-0 watchdog, and level
+  statistics don't need the measurement loop's cadence. The menu closes
+  *before* the capture starts, so presses during it are real HID sends —
+  that's how the display gets flipped between its two states mid-capture
+  — and any measurement those presses queue is discarded at capture end
+  (their t0 aged 10s; servicing them would bank instant-timeout garbage).
+  The Otsu subtlety, caught by testing the math against synthetic data
+  before flashing anything: with cleanly separated clusters the
+  between-class variance is *exactly constant* across the empty gap, so
+  a `>` comparison picks the plateau's first point and parks the
+  threshold ~3σ from the dim cluster with dozens of σ to spare on the
+  other side. The fix takes the midpoint of the plateau (bitwise
+  float-equality is sound there — nothing in the formula changes across
+  zero-count bins), which is the centre of the gap: maximum margin both
+  ways. The report shows both class means with spreads and a separation
+  figure (orange below 4×); the result screen is a MenuState
+  (`MENU_CAPTURE`) so the dismissing tap can't double as a HID press.
