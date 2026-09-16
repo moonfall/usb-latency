@@ -532,6 +532,22 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   Caveat not yet checked on hardware: the unit is a 5V part, so if its
   analog swing really does reach 5V it will clip at the ADC's ~3.3V
   ceiling (4095) rather than damaging anything visible in the reading.
+- **The sensor pin, and an optional GPIO-as-ground, are build flags —
+  `-DLIGHT_SENSOR_PIN=<gpio>` (default 1, the Grove analog line) and
+  `-DLIGHT_GND_PIN=<gpio>` (default -1, none).** Added for a bare BPW34
+  photodiode in photovoltaic mode straddling the bottom pads: its 5.08mm
+  lead pitch lands on G6 and G8 exactly (two 2.54mm pads, legs clearing
+  G7), so `-DLIGHT_SENSOR_PIN=6 -DLIGHT_GND_PIN=8 -DLIGHT_THRESHOLD=300`
+  gives anode→G6, cathode→G8-driven-LOW with no other components. A GPIO
+  held low is a real ground at photodiode currents (µA across tens of
+  ohms of Rds(on) = µV of error); both pins are ADC1-capable and
+  non-strapping so the roles swap freely — a meter view pinned near zero
+  under bright light means the diode is backwards, swap the flags not the
+  solder. The ~300 threshold is not optional: photovoltaic mode tops out
+  at ~0.35–0.45V (~300–500 counts) and can never reach the Unit Light's
+  3000. Same pinMode-once rule as the old TEPT4400 pull-up applies to the
+  ground pin. Compile-verified in both the default and the BPW34 flag
+  combination; not yet run on hardware.
 - **The on-screen numbers don't update until the measurement finishes.**
   This is deliberate, not a dropped frame: the UI task must not be
   pushing pixels over SPI while it is sampling the sensor, because a

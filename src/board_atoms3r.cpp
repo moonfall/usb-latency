@@ -179,14 +179,40 @@
 static const uint8_t SCREEN_BUTTON_PIN = 41;  // the LCD face is the button
 static const uint8_t BRIGHTNESS = 160;
 
-// --- Unit Light (U012: photoresistor + LM393) on the Grove port --------
-// The unit's two signal wires are yellow = digital (comparator output,
-// thresholded by the pot on the unit) and white = analog. On a Port A
-// Grove connector yellow is the SDA line and white is the SCL line, and
-// on the AtomS3R those are GPIO2 and GPIO1 respectively — so the analog
-// output lands on GPIO1, which is ADC1_CH0. Only the analog side is read
-// here; the digital side is left alone.
-static const uint8_t LIGHT_ANALOG_PIN = 1;
+// --- The light sensor ----------------------------------------------------
+// Default wiring: an M5Stack Unit Light (U012: photoresistor + LM393) on
+// the Grove port. The unit's two signal wires are yellow = digital
+// (comparator output, thresholded by the pot on the unit) and white =
+// analog. On a Port A Grove connector yellow is the SDA line and white is
+// the SCL line, and on the AtomS3R those are GPIO2 and GPIO1 respectively
+// — so the analog output lands on GPIO1, which is ADC1_CH0. Only the
+// analog side is read here; the digital side is left alone.
+//
+// Both the sense pin and an optional "virtual ground" pin are build-time
+// knobs, so a different sensor can be wired to different pads without
+// touching this file. The case that motivated them: a bare BPW34
+// photodiode in photovoltaic mode straddling the bottom expansion pads —
+// its 5.08mm lead pitch lands exactly on G6 and G8 (two 2.54mm pads
+// apart, legs clearing G7 in between), neither of which is a ground. So:
+//
+//     -DLIGHT_SENSOR_PIN=6 -DLIGHT_GND_PIN=8 -DLIGHT_THRESHOLD=300
+//
+// wires anode -> G6 (sense, ADC1_CH5), cathode -> G8, with G8 driven LOW
+// at task startup as the diode's ground. A GPIO held low is a perfectly
+// good ground at photodiode currents: microamps across a few tens of
+// ohms of Rds(on) is microvolts of error. Either pin works in either
+// role (both are ADC1-capable, neither is a strapping pin) — if the
+// meter view pins near zero under bright light, the diode is backwards;
+// swap the two flags rather than resoldering. The low threshold is the
+// other half of the story: photovoltaic mode tops out around 0.35-0.45V
+// (~300-500 counts), nowhere near the Unit Light's 3000.
+#ifndef LIGHT_SENSOR_PIN
+#define LIGHT_SENSOR_PIN 1
+#endif
+#ifndef LIGHT_GND_PIN
+#define LIGHT_GND_PIN -1  // -1: no virtual ground; the sensor has a real one
+#endif
+static const uint8_t LIGHT_ANALOG_PIN = LIGHT_SENSOR_PIN;
 static const int ADC_MAX = 4095;              // 12-bit, the Arduino default
 static const uint32_t LIGHT_PERIOD_MS = 100;  // metering cadence in the meter view
 static const int LIGHT_DEADBAND = 8;          // counts of ADC noise not worth a repaint
@@ -931,6 +957,17 @@ static void uiTaskFn(void *) {
   displayReady = display.init();
   if (displayReady) display.setBrightness(BRIGHTNESS);
   analogSetPinAttenuation(LIGHT_ANALOG_PIN, ADC_11db);  // full ~0-3.3V span
+#if LIGHT_GND_PIN >= 0
+  // The sensor's ground is a GPIO held low (see the sensor knobs above).
+  // Done once, here, and no code may call pinMode() on this pin again —
+  // same peripheral-manager rule as the old TEPT4400 pull-up (see the
+  // CLAUDE.md gotcha): a later pinMode() would reconfigure the pin and
+  // silently drop the drive. Until this line runs the pin floats and the
+  // sensor reads garbage; that window ends before the first press can be
+  // measured, since this task starts before loop()'s first pass matters.
+  pinMode(LIGHT_GND_PIN, OUTPUT);
+  digitalWrite(LIGHT_GND_PIN, LOW);
+#endif
 
   // Mount here and nowhere else. This is the one moment in the firmware's
   // life when a flash operation is harmless: USB is already up (main.cpp
