@@ -224,7 +224,15 @@ static const int LIGHT_DEADBAND = 8;          // counts of ADC noise not worth a
 #ifndef LIGHT_THRESHOLD
 #define LIGHT_THRESHOLD 3000
 #endif
-static const int lightThreshold = LIGHT_THRESHOLD;
+// Not const: a threshold calibration (see runThresholdCal()) can replace
+// it at runtime, and the replacement is persisted to NVS and re-loaded at
+// boot — so a stored calibration OUTRANKS the -DLIGHT_THRESHOLD build
+// flag from then on. Read and written only on the UI task (measurement,
+// meter tick, calibration report, the load at task startup), so a plain
+// int is safe. 0 in NVS means "nothing stored, use the flag".
+static int lightThreshold = LIGHT_THRESHOLD;
+static const char *SENSOR_PREFS_NAMESPACE = "sensor";  // own namespace, same reasoning as "runlog"
+static const char *SENSOR_PREFS_THR_KEY = "thr";
 
 // How long each of the threshold calibration's two captures samples for
 // (see runThresholdCal()). Unlike the measurement poll below, this loop
@@ -1148,6 +1156,10 @@ static void drawCaptureResult() {
   display.drawString(buf, SCREEN_W / 2, 74);
   snprintf(buf, sizeof(buf), "current threshold %d", lightThreshold);
   display.drawString(buf, SCREEN_W / 2, 88);
+  display.setTextColor(amber, black());
+  snprintf(buf, sizeof(buf), "hold: use %d", cal.thr);
+  display.drawString(buf, SCREEN_W / 2, 100);
+  display.setTextColor(dim, black());
   display.drawString("tap: done", SCREEN_W / 2, 112);
 }
 
@@ -1185,6 +1197,18 @@ static void uiTaskFn(void *) {
   displayReady = display.init();
   if (displayReady) display.setBrightness(BRIGHTNESS);
   analogSetPinAttenuation(LIGHT_ANALOG_PIN, ADC_11db);  // full ~0-3.3V span
+  {
+    // A previously calibrated threshold, if any, wins over the build
+    // flag. Loaded here — before the first press could possibly be
+    // measured — and range-checked so a corrupt value falls back to the
+    // flag rather than pinning measurements against a rail.
+    Preferences p;
+    if (p.begin(SENSOR_PREFS_NAMESPACE, true)) {
+      int stored = (int)p.getUInt(SENSOR_PREFS_THR_KEY, 0);
+      if (stored > 0 && stored < 4096) lightThreshold = stored;
+      p.end();
+    }
+  }
 #if LIGHT_GND_PIN >= 0
   // The sensor's ground is a GPIO held low (see the sensor knobs above).
   // Done once, here, and no code may call pinMode() on this pin again —
@@ -1337,10 +1361,25 @@ static void uiTaskFn(void *) {
           case ITEM_EXIT:  menuState = MENU_NONE; break;
           default: break;
         }
-      } else if (menuState == MENU_MODE || menuState == MENU_STORAGE ||
-                 menuState == MENU_CAPTURE) {
-        // The pickers persist per tap and the capture report is only a
-        // report — in all three, a hold just leaves.
+      } else if (menuState == MENU_MODE || menuState == MENU_STORAGE) {
+        // Both pickers persist per tap — nothing to do here but leave.
+        menuState = MENU_NONE;
+      } else if (menuState == MENU_CAPTURE) {
+        // On the report, hold means "use it": the calibrated threshold
+        // becomes the live one and is persisted, so it survives reboots
+        // and outranks the build flag from now on (see lightThreshold's
+        // comment; tap remains leave-without-applying). The NVS write
+        // stalls the flash cache on both cores — harmless precisely
+        // here, mid-menu, with no run going and no measurement
+        // outstanding; the same licence the pairing item has.
+        if (cal.done && cal.thr > 0 && cal.thr < 4096) {
+          lightThreshold = cal.thr;
+          Preferences p;
+          if (p.begin(SENSOR_PREFS_NAMESPACE, false)) {
+            p.putUInt(SENSOR_PREFS_THR_KEY, (uint32_t)cal.thr);
+            p.end();
+          }
+        }
         menuState = MENU_NONE;
       } else if (menuState == MENU_DRIVE) {
         // The only gesture a storage boot has. It cannot change what the

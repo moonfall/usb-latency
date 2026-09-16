@@ -976,4 +976,13 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   the wait and again after the flow, so a tap queued during either
   capture can neither start phase 2 early nor dismiss the report
   unread. Sampling yields every iteration (`vTaskDelay(1)`) — a 10s
-  unyielding poll would trip the 5s core-0 watchdog.
+  unyielding poll would trip the 5s core-0 watchdog. On the report,
+  **hold applies the calibrated threshold**: `lightThreshold` is mutable,
+  the value is persisted to NVS (namespace `sensor`, key `thr`) and
+  re-loaded at UI-task startup — which means **a stored calibration
+  outranks `-DLIGHT_THRESHOLD` from then on**. Changing the build flag
+  and reflashing will appear to do nothing on a device that has ever
+  had a calibration applied; re-calibrate (or erase the `sensor`
+  namespace) to change it. 0/out-of-range in NVS falls back to the
+  flag. The threshold is read and written only on the UI task, which is
+  what makes the plain `int` safe.
