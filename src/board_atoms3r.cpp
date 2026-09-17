@@ -1566,6 +1566,7 @@ static void uiTaskFn(void *) {
   // again, and it has to be one: LINK_NONE is a real value here (every
   // non-BLE mode sits in it forever).
   LinkState shownLink = (LinkState)0xFF;
+  uint8_t shownSensor = 0xFF;  // != any real config, forces the first draw
   uint16_t shownAutoDone = 0xFFFF;      // != any real count, same trick again
   uint16_t shownAutoTotal = 0xFFFF;
   int shownRaw = -1;
@@ -1732,7 +1733,7 @@ static void uiTaskFn(void *) {
                      meterView != shownMeter ||
                      menuState != shownMenuState || topIndex != shownTopIndex ||
                      armed != shownArmed || ejected != shownEjected ||
-                     link != shownLink);
+                     link != shownLink || activeSensor != shownSensor);
     // A clear only shows up in the measure view's top strip; the meter
     // view is live anyway and will repaint on its own cadence. The
     // histogram is visible in both views, so it always needs redrawing.
@@ -1791,6 +1792,7 @@ static void uiTaskFn(void *) {
         drawFrame(active, pending, raw, mv, hint, link);
         shownActive = active;
         shownLink = link;
+        shownSensor = activeSensor;
         shownPending = pending;
         shownMeter = meterView;
         shownHint = hint;
