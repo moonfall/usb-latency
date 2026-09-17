@@ -986,3 +986,38 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   namespace) to change it. 0/out-of-range in NVS falls back to the
   flag. The threshold is read and written only on the UI task, which is
   what makes the plain `int` safe.
+- **The "Validate" menu item is the diagnostic for impossibly-fast
+  detections, and its idle-flip counter is the number to look at first.**
+  A validation run is 20 presses with 1.5-3s settling gaps (main.cpp
+  paces it through the same machinery as the auto test; see
+  `appStartValidation()`), during which the board watches the sensor the
+  whole time: between presses the UI task's wait is replaced by ~1kHz
+  idle watching, so any confirmed threshold crossing with no input in
+  flight is counted as an *idle flip* — a light change nobody asked for,
+  which is what backlight PWM, pixel-inversion flicker, mains-flickering
+  room lights, or a too-thin threshold margin look like. After each
+  press's crossing the watcher keeps going for `VAL_POSTWATCH_MS` and
+  counts extra crossings (a press should change the light exactly once),
+  and anything under `VAL_FAST_US` (1ms — the full-speed-USB polling
+  floor) is classed impossible rather than banked. Validation samples
+  never touch the stats, histogram, or run files (`appRecordSample()` is
+  skipped, so `boardWriteRun()` sees an empty record and declines). The
+  report ends in a verdict naming the likeliest culprit, idle flips
+  outranking everything — unrequested changes make every other number
+  unreliable.
+- **The false-trigger protections were LOST for a while — shelving the
+  TEPT4400 branch took them with it.** `MEASURE_CONFIRM` (3 consecutive
+  agreeing samples per crossing, clock stopped at the run's first
+  sample) and the 4-read averaged baseline were added to
+  `runMeasurement()` in the SFH309 era — on what became the tept4400
+  branch. When that branch was shelved, main's `runMeasurement()`
+  silently reverted to single-read baseline and single-sample crossings,
+  and the impossibly-fast detections duly returned with the next
+  low-margin sensor. Both protections are back in main (restored
+  alongside the validation mode) — if a measurement-path hardening ever
+  looks missing, check whether it lives on an unmerged branch before
+  re-deriving it.
+- **The top menu is at seven rows, its hard ceiling.** The "MENU" heading
+  was dropped to make room for the seventh (Validate): 12px pitch from
+  y=8 puts row seven at y=80, hints at 96/108. An eighth item needs a
+  scrolling menu, not another row.

@@ -246,6 +246,17 @@ static const char *SENSOR_PREFS_THR_KEY = "thr";
 // keep it well under the 5s task watchdog.
 static const uint32_t MEASURE_TIMEOUT_MS = 500;
 
+// Consecutive samples that must agree before a threshold crossing counts,
+// in the measurement, the validation's watchers, everywhere. Exists
+// because single-sample ADC noise blips near a low threshold produced
+// impossible sub-millisecond "measurements". NOTE: this protection (and
+// the averaged baseline in runMeasurement()) was first added in the
+// SFH309 era, then lost when that sensor's code was shelved to the
+// tept4400 branch — the fast-detection complaints that led to the
+// validation mode were, in part, this fix being missing. It is
+// deliberately part of main again now.
+static const int MEASURE_CONFIRM = 3;
+
 // How many of the most recent samples, per direction, the histogram is
 // built from. Override with -DHIST_CAPACITY=<n> if 500 is more or less
 // than you want; memory cost is 4 bytes/sample/direction (2*4*n), so 500
@@ -354,7 +365,7 @@ static volatile uint16_t autoTotal = 0;
 // menu state for the same reason MENU_DRIVE is one: while it is up,
 // boardMenuActive() keeps every press (the continue tap, the dismissing
 // tap, anything stray mid-capture) from also being a HID press.
-enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE, MENU_CAPTURE };
+enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE, MENU_CAPTURE, MENU_VAL };
 static volatile MenuState menuState = MENU_NONE;
 static int topIndex = 0;
 
@@ -367,6 +378,7 @@ static int topIndex = 0;
 enum TopItem : uint8_t {
   ITEM_METER,
   ITEM_AUTO,
+  ITEM_VALIDATE,
   ITEM_DRIVE,
   ITEM_MODE,
   ITEM_PAIR,   // BLE modes only
@@ -374,7 +386,7 @@ enum TopItem : uint8_t {
   ITEM_KINDS,
 };
 static const char *TOP_ITEM_LABELS[ITEM_KINDS] = {
-  "Light meter", "Auto test", "USB drive", "Change mode", "Pairing", "Exit"
+  "Light meter", "Auto test", "Validate", "USB drive", "Change mode", "Pairing", "Exit"
 };
 // Built once per boot by buildTopMenu(), from the mode. Fixed for the
 // life of the boot, exactly like the mode it is derived from, so nothing
@@ -446,6 +458,23 @@ static History histFall;
 // handling in uiTaskFn).
 static bool meterView = false;
 
+static const uint32_t VAL_POSTWATCH_MS = 300;
+static const uint32_t VAL_FAST_US = 1000;
+
+struct ValStats {
+  uint16_t presses = 0, timeouts = 0, fastCnt = 0, multiCnt = 0, cleanCnt = 0;
+  uint32_t idleFlips = 0;   // confirmed crossings with no input in flight
+  uint16_t flipsSincePress = 0;
+  uint32_t minUs = 0, sumUs = 0, latCnt = 0;
+};
+static ValStats val;
+static bool validationActive = false;  // set/cleared on the UI task only
+
+// Idle-watch side tracking, persistent across watch slices so a flip
+// straddling two slices still counts once. -1 = unknown, re-learn.
+static int valIdleSide = -1;
+static int valIdleRun = 0;
+
 static uint16_t black() { return display.color565(0, 0, 0); }
 static uint16_t riseColor() { return display.color565(120, 220, 230); }  // cyan
 static uint16_t fallColor() { return display.color565(255, 130, 220); }  // magenta
@@ -503,16 +532,34 @@ static uint16_t linkColor(LinkState link) {
 // loop() is on core 1 and is untouched throughout; the USB task sits at a
 // higher priority and still preempts this freely.
 static void runMeasurement(int64_t t0) {
-  int baseline = analogRead(LIGHT_ANALOG_PIN);
+  // Averaged baseline: a single read sits within ADC noise of a low
+  // threshold, and a noise-displaced baseline picks the wrong crossing
+  // direction. ~100us of reads, none of it in the reported figure — t0
+  // is already fixed.
+  int32_t baselineSum = 0;
+  for (int i = 0; i < 4; i++) baselineSum += analogRead(LIGHT_ANALOG_PIN);
+  int baseline = baselineSum / 4;
   bool waitForRise = baseline < lightThreshold;
   int64_t deadline = t0 + (int64_t)MEASURE_TIMEOUT_MS * 1000;
 
+  // A crossing counts only after MEASURE_CONFIRM consecutive agreeing
+  // reads — but the reported time is the FIRST read of the run, so the
+  // confirmation rejects one-sample noise blips without adding a
+  // microsecond to the figure.
+  int64_t crossAt = 0;
+  int run = 0;
   for (;;) {
     int v = analogRead(LIGHT_ANALOG_PIN);
     int64_t now = esp_timer_get_time();
 
     if (waitForRise ? (v >= lightThreshold) : (v < lightThreshold)) {
-      uint32_t us = (uint32_t)(now - t0);
+      if (run == 0) crossAt = now;
+      // No deadline check while confirming: staying crossed confirms
+      // within MEASURE_CONFIRM samples (microseconds), and dropping back
+      // resets run and falls through to the deadline check below — so
+      // the loop cannot fail to terminate.
+      if (++run < MEASURE_CONFIRM) continue;
+      uint32_t us = (uint32_t)(crossAt - t0);
       lastLatencyUs = (int32_t)us;
       lastLatencyWasRise = waitForRise;
       if (waitForRise) {
@@ -696,7 +743,8 @@ static void drawNextLine(Mode active, Mode pending, HoldRung hint) {
     // back to the normal display on its last release.) Raising the
     // iteration count to four digits would push this over and clip the
     // tail, so shorten the hint if that ever happens.
-    snprintf(buf, sizeof(buf), "AUTO %u/%u tap=stop",
+    snprintf(buf, sizeof(buf), "%s %u/%u tap=stop",
+             validationActive ? "VAL" : "AUTO",
              (unsigned)autoDone, (unsigned)autoTotal);
     color = riseColor();
   } else if (appStorageArmed()) {
@@ -808,17 +856,15 @@ static void drawMenuTop() {
 
   display.setFont(&fonts::Font0);
   display.setTextDatum(textdatum_t::top_center);
-  display.setTextColor(dim, black());
-  display.drawString("MENU", SCREEN_W / 2, 6);
 
-  // Six items (a BLE mode's list) at the previous 14px pitch from y=22
-  // would put the last row at y=92, overlapping the "tap: next" hint at
-  // y=96. 12px from y=20 lands it at y=80 with eight clear pixels below,
-  // and Font0 is 8px tall so a 12px pitch still leaves a visible gap
-  // between rows. That is the panel full: a seventh item needs a
-  // scrolling menu, not another row.
+  // Seven items (a BLE mode's list, Validate included) no longer leave
+  // room for a heading: 12px pitch from y=8 puts the seventh row at
+  // y=80, with the hints at 96/108 below. The "MENU" title paid for the
+  // seventh row — the amber selection marker already says what screen
+  // this is. THIS is the panel full: an eighth item needs a scrolling
+  // menu, not another row.
   const int rowH = 12;
-  const int top = 20;
+  const int top = 8;
   char buf[24];
   for (int i = 0; i < numTopItems; i++) {
     bool selected = (i == topIndex);
@@ -1115,6 +1161,185 @@ static void runThresholdCal() {
   }
 }
 
+// --- Validation run (the menu's "Validate" item) ------------------------
+// A short auto test (VALIDATE_ITERATIONS presses, long settling gaps —
+// main.cpp paces it, see appStartValidation()) whose product is a
+// verdict, not a distribution. What it adds over a normal run:
+//
+//  * Idle watching. Between presses the UI task samples the sensor at
+//    ~1kHz and counts confirmed threshold crossings. During a settling
+//    gap no input has been sent, so every crossing counted there is a
+//    light change nobody asked for — backlight PWM, pixel-inversion
+//    flicker, mains-flickering room lights, a marginal threshold. This
+//    is the number that explains impossibly-fast measurements: a source
+//    of unrequested crossings will happily stop a real measurement's
+//    clock a few hundred microseconds after the press.
+//  * One-change-per-press checking. After a measurement's crossing, the
+//    watcher keeps going for VAL_POSTWATCH_MS and counts any further
+//    crossings — a press should change the light exactly once.
+//  * A physical floor. Anything under VAL_FAST_US (1ms — a full-speed
+//    USB device cannot even get its report polled faster than that) is
+//    counted as impossible rather than banked as a latency.
+//
+// Validation samples never touch the stats, the histogram, or a run
+// file — appRecordSample() is not called for them. The report is the
+// product.
+
+// One ~LIGHT_PERIOD_MS slice of idle watching, in place of the UI task's
+// normal blocking wait. Returns early the moment any request lands so
+// menu/press handling stays as responsive as the notify path it replaces.
+static void validationIdleWatch() {
+  uint32_t start = millis();
+  while ((uint32_t)(millis() - start) < LIGHT_PERIOD_MS) {
+    if (measurePending || resetRequested || enterMenuRequested ||
+        menuTapRequested || menuSelectRequested) return;
+    int side = (analogRead(LIGHT_ANALOG_PIN) >= lightThreshold) ? 1 : 0;
+    if (valIdleSide < 0) {
+      valIdleSide = side;
+      valIdleRun = 0;
+    } else if (side != valIdleSide) {
+      if (++valIdleRun >= MEASURE_CONFIRM) {  // same noise gate as a measurement
+        valIdleSide = side;
+        valIdleRun = 0;
+        val.idleFlips++;
+        val.flipsSincePress++;
+      }
+    } else {
+      valIdleRun = 0;
+    }
+    vTaskDelay(1);
+  }
+}
+
+// The validation flavour of runMeasurement(): same baseline, same
+// confirmed crossing, same timestamping — plus the post-crossing watch
+// and the classification. Deliberately does NOT record into the stats,
+// the histogram, or via appRecordSample().
+static void runValidatedMeasurement(int64_t t0) {
+  const uint16_t flipsBefore = val.flipsSincePress;
+  val.flipsSincePress = 0;
+  val.presses++;
+
+  int32_t baselineSum = 0;
+  for (int i = 0; i < 4; i++) baselineSum += analogRead(LIGHT_ANALOG_PIN);
+  int baseline = baselineSum / 4;
+  bool waitForRise = baseline < lightThreshold;
+  int64_t deadline = t0 + (int64_t)MEASURE_TIMEOUT_MS * 1000;
+
+  int64_t crossAt = 0;
+  int run = 0;
+  bool crossed = false;
+  uint32_t us = 0;
+  for (;;) {
+    int v = analogRead(LIGHT_ANALOG_PIN);
+    int64_t now = esp_timer_get_time();
+    if (waitForRise ? (v >= lightThreshold) : (v < lightThreshold)) {
+      if (run == 0) crossAt = now;
+      if (++run >= MEASURE_CONFIRM) {
+        us = (uint32_t)(crossAt - t0);
+        crossed = true;
+        break;
+      }
+    } else {
+      run = 0;
+    }
+    if (now >= deadline) break;
+  }
+
+  if (!crossed) {
+    val.timeouts++;
+    valIdleSide = -1;
+    return;
+  }
+
+  // The one-change-per-press check: stay on watch past the crossing and
+  // count any further confirmed flips. Yields per sample — this loop
+  // runs for VAL_POSTWATCH_MS, far past the tight poll's watchdog
+  // licence.
+  int extras = 0;
+  int side = waitForRise ? 1 : 0;
+  int erun = 0;
+  uint32_t postStart = millis();
+  while ((uint32_t)(millis() - postStart) < VAL_POSTWATCH_MS) {
+    int v = analogRead(LIGHT_ANALOG_PIN);
+    int es = (v >= lightThreshold) ? 1 : 0;
+    if (es != side) {
+      if (++erun >= MEASURE_CONFIRM) {
+        side = es;
+        erun = 0;
+        extras++;
+      }
+    } else {
+      erun = 0;
+    }
+    vTaskDelay(1);
+  }
+
+  bool fast = us < VAL_FAST_US;
+  if (fast) val.fastCnt++;
+  if (extras > 0) val.multiCnt++;
+  if (!fast && extras == 0 && flipsBefore == 0) val.cleanCnt++;
+  if (val.latCnt == 0 || us < val.minUs) val.minUs = us;
+  val.sumUs += us;
+  val.latCnt++;
+  valIdleSide = side;  // the watcher's notion of "current side" stays fresh
+  valIdleRun = 0;
+}
+
+// The validation report: counts first, verdict last — and the verdict
+// names the likeliest culprit rather than leaving the counts to be
+// decoded, because the whole point of the mode is to say what is wrong.
+static void drawValReport() {
+  uint16_t dim = dimColor();
+  uint16_t warn = display.color565(255, 140, 60);
+  uint16_t good = display.color565(120, 220, 130);
+  char buf[32];
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  display.drawString("VALIDATION", SCREEN_W / 2, 4);
+
+  snprintf(buf, sizeof(buf), "presses %u  timeout %u", val.presses, val.timeouts);
+  display.drawString(buf, SCREEN_W / 2, 20);
+  display.setTextColor(val.cleanCnt == val.presses ? good : dim, black());
+  snprintf(buf, sizeof(buf), "clean %u/%u", val.cleanCnt, val.presses);
+  display.drawString(buf, SCREEN_W / 2, 32);
+  display.setTextColor((val.fastCnt || val.multiCnt) ? warn : dim, black());
+  snprintf(buf, sizeof(buf), "fast<1ms %u  multi %u", val.fastCnt, val.multiCnt);
+  display.drawString(buf, SCREEN_W / 2, 44);
+  display.setTextColor(val.idleFlips ? warn : dim, black());
+  snprintf(buf, sizeof(buf), "idle flips %lu", (unsigned long)val.idleFlips);
+  display.drawString(buf, SCREEN_W / 2, 56);
+  if (val.latCnt) {
+    display.setTextColor(dim, black());
+    uint32_t avg = val.sumUs / val.latCnt;
+    snprintf(buf, sizeof(buf), "lat min %lu.%lu avg %lu.%lu",
+             (unsigned long)(val.minUs / 1000), (unsigned long)((val.minUs % 1000) / 100),
+             (unsigned long)(avg / 1000), (unsigned long)((avg % 1000) / 100));
+    display.drawString(buf, SCREEN_W / 2, 68);
+  }
+
+  // The verdict, most damning evidence first: unrequested changes make
+  // every other number unreliable, so they outrank everything.
+  display.setTextColor(warn, black());
+  if (val.idleFlips > 0) {
+    display.drawString("light changes w/o input!", SCREEN_W / 2, 86);
+    display.drawString("PWM/flicker or thin margin", SCREEN_W / 2, 96);
+  } else if (val.fastCnt > 0) {
+    display.drawString("impossibly fast crossings", SCREEN_W / 2, 86);
+    display.drawString("during presses: re-cal thr", SCREEN_W / 2, 96);
+  } else if (val.multiCnt > 0) {
+    display.drawString("multiple changes per press", SCREEN_W / 2, 86);
+  } else if (val.presses && val.cleanCnt == val.presses) {
+    display.setTextColor(good, black());
+    display.drawString("all clean", SCREEN_W / 2, 88);
+  }
+
+  display.setTextColor(dim, black());
+  display.drawString("tap: done", SCREEN_W / 2, 112);
+}
+
 // The calibration's report. Suggested threshold big and amber, both
 // sets' level and spread, and either the margin (clean) or the overlap
 // count (not) — so "how safe is this threshold" is a number on the
@@ -1178,6 +1403,8 @@ static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung 
     drawMenuDrive(pending);
   } else if (menuState == MENU_CAPTURE) {
     drawCaptureResult();
+  } else if (menuState == MENU_VAL) {
+    drawValReport();
   } else {
     drawTopStrip(raw, mv);
     drawModeLine(active, link);
@@ -1310,8 +1537,8 @@ static void uiTaskFn(void *) {
         // so the hold that follows is only ever "I'm done looking".
         appSetStorageArmed(!appStorageArmed());
       }
-      else if (menuState == MENU_CAPTURE) {
-        menuState = MENU_NONE;  // the report has one job: be read, then leave
+      else if (menuState == MENU_CAPTURE || menuState == MENU_VAL) {
+        menuState = MENU_NONE;  // the reports have one job: be read, then leave
       }
       // MENU_DRIVE deliberately ignores taps: a stray brush of the screen
       // face while the host is copying files must not change what the
@@ -1343,9 +1570,21 @@ static void uiTaskFn(void *) {
               menuTapRequested = false;   // a tap queued during phase 2
               menuSelectRequested = false; // must not dismiss the report
             } else {
+              validationActive = false;  // a stale flag must not colour this run
               appStartAutoTest();
               menuState = MENU_NONE;
             }
+            break;
+          case ITEM_VALIDATE:
+            // Fresh counters per run; the report is only ever about the
+            // run that just happened. validationActive arms the board's
+            // half (idle watching, validated measurements) — and is also
+            // what routes the run-end signal to the report screen.
+            val = ValStats();
+            valIdleSide = -1;
+            validationActive = true;
+            appStartValidation();
+            menuState = MENU_NONE;
             break;
           case ITEM_DRIVE: menuState = MENU_STORAGE; break;
           case ITEM_MODE:  menuState = MENU_MODE; break;
@@ -1361,8 +1600,10 @@ static void uiTaskFn(void *) {
           case ITEM_EXIT:  menuState = MENU_NONE; break;
           default: break;
         }
-      } else if (menuState == MENU_MODE || menuState == MENU_STORAGE) {
-        // Both pickers persist per tap — nothing to do here but leave.
+      } else if (menuState == MENU_MODE || menuState == MENU_STORAGE ||
+                 menuState == MENU_VAL) {
+        // The pickers persist per tap and the validation report is only
+        // a report — in all three, a hold just leaves.
         menuState = MENU_NONE;
       } else if (menuState == MENU_CAPTURE) {
         // On the report, hold means "use it": the calibrated threshold
@@ -1417,10 +1658,16 @@ static void uiTaskFn(void *) {
     // view too: the measurement is what the press is for either way.
     if (measurePending) {
       measurePending = false;
-      runMeasurement(pressMicros);
+      if (validationActive && autoTotal > 0) {
+        // A validation run's press: measured the same way, then watched
+        // past the crossing, classified, and kept out of the stats.
+        runValidatedMeasurement(pressMicros);
+      } else {
+        runMeasurement(pressMicros);
+        histDirty = true;
+        if (!meterView) topDirty = true;
+      }
       measureBusy = false;  // releases the automated test's next press
-      histDirty = true;
-      if (!meterView) topDirty = true;
     }
 
     // A press that produced no report — a BLE mode with nobody listening.
@@ -1493,9 +1740,31 @@ static void uiTaskFn(void *) {
       }
     }
 
+    // A validation run ending (or aborting) is detected here, as the
+    // autoTotal handoff from main.cpp dropping back to zero, and lands
+    // on the report screen. Detected on this task rather than acted on
+    // in boardShowAutoTest() because menuState belongs to this task.
+    {
+      static uint16_t prevAutoTotal = 0;
+      uint16_t curTotal = autoTotal;
+      if (validationActive && prevAutoTotal > 0 && curTotal == 0) {
+        validationActive = false;
+        menuState = MENU_VAL;
+      }
+      prevAutoTotal = curTotal;
+    }
+
     // Wake on the next press/release edge or hold rung, or after
     // LIGHT_PERIOD_MS to re-meter the sensor — whichever comes first.
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(LIGHT_PERIOD_MS));
+    // During a validation run's gaps the wait is spent watching the
+    // sensor instead of blocking: an idle crossing found there is the
+    // whole reason the mode exists. The watch polls the same request
+    // flags the notify path would wake for, so responsiveness holds.
+    if (validationActive && autoTotal > 0 && !measurePending) {
+      validationIdleWatch();
+    } else {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(LIGHT_PERIOD_MS));
+    }
   }
 }
 
@@ -1760,6 +2029,7 @@ static void buildTopMenu(Mode active) {
   numTopItems = 0;
   topItems[numTopItems++] = ITEM_METER;
   topItems[numTopItems++] = ITEM_AUTO;
+  topItems[numTopItems++] = ITEM_VALIDATE;
   topItems[numTopItems++] = ITEM_DRIVE;
   topItems[numTopItems++] = ITEM_MODE;
   if (modeIsBle(active)) topItems[numTopItems++] = ITEM_PAIR;

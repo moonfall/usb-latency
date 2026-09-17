@@ -196,6 +196,16 @@ static const uint32_t MODE_HOLD_MS = 3000;
 // per direction, comfortably inside the board's HIST_CAPACITY (500 per
 // direction) so a whole run stays in the histogram.
 static const uint16_t AUTO_TEST_ITERATIONS = 500;
+
+// The validation flavour of the run (see appStartValidation()): far
+// fewer presses with far longer settling between them, because its
+// product is not a distribution — it is a verdict on whether the setup
+// can be trusted to produce one. The long gap is the point: it gives the
+// board's idle-watching (see board_atoms3r.cpp) a wide window in which
+// any light change is by definition unrequested.
+static const uint16_t VALIDATE_ITERATIONS = 20;
+static const uint32_t VALIDATE_GAP_MIN_MS = 1500;
+static const uint32_t VALIDATE_GAP_MAX_MS = 3000;
 static const uint32_t AUTO_HOLD_MS = 50;      // plausible press length
 static const uint32_t AUTO_GAP_MIN_MS = 200;  // gap between releases and the next press
 static const uint32_t AUTO_GAP_MAX_MS = 500;
@@ -262,6 +272,7 @@ static uint32_t autoResumeAtMs = 0;
 // volatile: set by appStartAutoTest() from the board's UI task on core 0,
 // consumed by loop() on core 1.
 static volatile bool autoStartRequested = false;
+static volatile bool autoIsValidation = false;  // set with autoStartRequested, same core
 static bool pressAbortedAuto = false;  // this press stopped a run and sends nothing
 
 // --- Recording a run --------------------------------------------------
@@ -1000,7 +1011,15 @@ static void collectSample() {
 // very distribution this tool exists to measure. 200-500ms also keeps a
 // 100-press run to about a minute.
 static uint32_t autoGapMs() {
+  if (autoIsValidation) {
+    return VALIDATE_GAP_MIN_MS +
+           (esp_random() % (VALIDATE_GAP_MAX_MS - VALIDATE_GAP_MIN_MS + 1));
+  }
   return AUTO_GAP_MIN_MS + (esp_random() % (AUTO_GAP_MAX_MS - AUTO_GAP_MIN_MS + 1));
+}
+
+static uint16_t runIterations() {
+  return autoIsValidation ? VALIDATE_ITERATIONS : AUTO_TEST_ITERATIONS;
 }
 
 static void stopAutoTest() {
@@ -1022,6 +1041,20 @@ static void stopAutoTest() {
 }
 
 void appStartAutoTest() {
+  autoIsValidation = false;
+  autoStartRequested = true;
+}
+
+// The validation run: identical plumbing to the auto test — same press
+// path, same abort gesture, same completion signalling — differing only
+// in count and pacing. Everything that makes it a *validation* (idle
+// watching, post-crossing watching, the verdict report) lives in the
+// board layer, which knows it started one; main.cpp only paces it.
+// Validation samples never reach the stats or a run file: the board
+// skips appRecordSample() for them, so runCount stays 0 and
+// boardWriteRun() declines empty records.
+void appStartValidation() {
+  autoIsValidation = true;
   autoStartRequested = true;
 }
 
@@ -1050,7 +1083,7 @@ static void finishRun() {
 
   RunRecord rec;
   rec.mode = activeMode;
-  rec.planned = AUTO_TEST_ITERATIONS;
+  rec.planned = runIterations();
   rec.count = runCount;
   rec.aborted = runAborted;
   rec.samples = runSamples;
@@ -1094,7 +1127,7 @@ static void serviceAutoTest(uint32_t now) {
     // the moment not to be taking a reading.
     runGapMs = autoGapMs();
     autoResumeAtMs = now + runGapMs;
-    boardShowAutoTest(0, AUTO_TEST_ITERATIONS);
+    boardShowAutoTest(0, runIterations());
   }
 
   switch (autoPhase) {
@@ -1150,7 +1183,7 @@ static void serviceAutoTest(uint32_t now) {
       // that preceded this press.
       collectSample();
 
-      if (autoDone >= AUTO_TEST_ITERATIONS) {
+      if (autoDone >= runIterations()) {
         autoPhase = AUTO_OFF;
         boardShowAutoTest(0, 0);
         runFlushPending = true;  // written on the next pass, by finishRun()
@@ -1158,7 +1191,7 @@ static void serviceAutoTest(uint32_t now) {
         autoPhase = AUTO_GAP;
         runGapMs = autoGapMs();
         autoResumeAtMs = now + runGapMs;
-        boardShowAutoTest(autoDone, AUTO_TEST_ITERATIONS);
+        boardShowAutoTest(autoDone, runIterations());
       }
       return;
   }

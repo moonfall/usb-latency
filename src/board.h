@@ -184,6 +184,13 @@ void appAdvancePendingMode();
 // never calls this.
 void appStartAutoTest();
 
+// Implemented in main.cpp; called by the menu's "Validate" item. Same
+// machinery as appStartAutoTest() but VALIDATE_ITERATIONS presses with a
+// much longer settling gap — the pacing half of the validation mode whose
+// observation half (idle-crossing counting, one-change-per-press
+// checking) the board runs itself.
+void appStartValidation();
+
 // --- Recording an automated run ----------------------------------------
 // Every automated run is written out as a CSV file on the board's flash
 // filesystem, so a distribution can be looked at properly afterwards
