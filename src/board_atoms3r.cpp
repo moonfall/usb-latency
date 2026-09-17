@@ -180,59 +180,106 @@ static const uint8_t SCREEN_BUTTON_PIN = 41;  // the LCD face is the button
 static const uint8_t BRIGHTNESS = 160;
 
 // --- The light sensor ----------------------------------------------------
-// Default wiring: an M5Stack Unit Light (U012: photoresistor + LM393) on
-// the Grove port. The unit's two signal wires are yellow = digital
-// (comparator output, thresholded by the pot on the unit) and white =
-// analog. On a Port A Grove connector yellow is the SDA line and white is
-// the SCL line, and on the AtomS3R those are GPIO2 and GPIO1 respectively
-// — so the analog output lands on GPIO1, which is ADC1_CH0. Only the
-// analog side is read here; the digital side is left alone.
+// Unit Light wiring, for the record: the module's two Grove signal wires
+// are yellow = digital (LM393 comparator, thresholded by the module's
+// pot) and white = analog; on a Port A connector yellow is SDA and white
+// is SCL, which on the AtomS3R are GPIO2 and GPIO1 — so the analog
+// output lands on GPIO1 (ADC1_CH0), and only the analog side is read.
 //
-// Both the sense pin and an optional "virtual ground" pin are build-time
-// knobs, so a different sensor can be wired to different pads without
-// touching this file. The case that motivated them: a bare BPW34
-// photodiode in photovoltaic mode straddling the bottom expansion pads —
-// its 5.08mm lead pitch lands exactly on G6 and G8 (two 2.54mm pads
-// apart, legs clearing G7 in between), neither of which is a ground. So:
+// Sensor configurations, selectable at runtime from the menu ("Sensor")
+// and persisted in NVS — the -DLIGHT_SENSOR_PIN / -DLIGHT_GND_PIN build
+// knobs this replaces required a reflash to swap sensors, which turned
+// out to be exactly the wrong shape once two sensors were physically
+// wired at once.
 //
-//     -DLIGHT_SENSOR_PIN=6 -DLIGHT_GND_PIN=8 -DLIGHT_THRESHOLD=300
+//  [0] Unit Light (default): the Grove module, analog on GPIO1. The
+//      default because it is the sensor a fresh device is assumed to
+//      have — a stored selection of a sensor that isn't wired reads a
+//      floating pin, so the safe one has to be what NVS-less boots get.
+//  [1] BPW34: bare photodiode in photovoltaic mode straddling the
+//      bottom pads — 5.08mm lead pitch lands on G6 (anode, sense) and
+//      G8 (cathode) exactly, legs clearing G7. G8 is driven LOW as the
+//      diode's ground when this config activates: a GPIO held low is a
+//      real ground at photodiode currents (uA across tens of ohms of
+//      Rds(on) = uV of error). Photovoltaic swing tops out ~0.35-0.45V,
+//      hence the ~250-count default threshold; wired backwards it pins
+//      near zero in the meter view — swap the legs.
 //
-// wires anode -> G6 (sense, ADC1_CH5), cathode -> G8, with G8 driven LOW
-// at task startup as the diode's ground. A GPIO held low is a perfectly
-// good ground at photodiode currents: microamps across a few tens of
-// ohms of Rds(on) is microvolts of error. Either pin works in either
-// role (both are ADC1-capable, neither is a strapping pin) — if the
-// meter view pins near zero under bright light, the diode is backwards;
-// swap the two flags rather than resoldering. The low threshold is the
-// other half of the story: photovoltaic mode tops out around 0.35-0.45V
-// (~300-500 counts), nowhere near the Unit Light's 3000.
-#ifndef LIGHT_SENSOR_PIN
-#define LIGHT_SENSOR_PIN 1
+// Each config carries its own default threshold AND its own calibrated
+// NVS slot ("thr0"/"thr1", see activateSensor()): a threshold is a
+// property of a sensor circuit, and one global value would let
+// calibrating one sensor silently clobber the other's.
+struct SensorConfig {
+  const char *name;   // picker + reports
+  const char *tag;    // meter view prefix
+  uint8_t pin;        // ADC sense pin
+  int8_t gndPin;      // driven LOW while active; -1 = sensor has a real ground
+  int defaultThr;     // used when no calibration is stored for this config
+};
+#ifndef LIGHT_THRESHOLD
+#define LIGHT_THRESHOLD 3000  // Unit Light default; per-config, see the table
 #endif
-#ifndef LIGHT_GND_PIN
-#define LIGHT_GND_PIN -1  // -1: no virtual ground; the sensor has a real one
+#ifndef BPW34_THRESHOLD
+#define BPW34_THRESHOLD 250
 #endif
-static const uint8_t LIGHT_ANALOG_PIN = LIGHT_SENSOR_PIN;
+static const SensorConfig SENSORS[] = {
+  { "Unit Light", "UL", 1, -1, LIGHT_THRESHOLD },
+  { "BPW34",      "PD", 6,  8, BPW34_THRESHOLD },
+};
+static const uint8_t SENSOR_COUNT = sizeof(SENSORS) / sizeof(SENSORS[0]);
+// Which config is live. Read everywhere the sensor is touched (all UI
+// task), written by the picker and at boot (also UI task) — plain, safe.
+static uint8_t activeSensor = 0;
+static inline uint8_t sensorPin() { return SENSORS[activeSensor].pin; }
+
 static const int ADC_MAX = 4095;              // 12-bit, the Arduino default
 static const uint32_t LIGHT_PERIOD_MS = 100;  // metering cadence in the meter view
 static const int LIGHT_DEADBAND = 8;          // counts of ADC noise not worth a repaint
 
-// The level the reading has to cross for a measurement to stop. Override
-// from platformio.ini with -DLIGHT_THRESHOLD=<counts> if 3000 doesn't
-// sit between your display's two states; the meter view draws it on the bar
-// so you can see where it falls.
-#ifndef LIGHT_THRESHOLD
-#define LIGHT_THRESHOLD 3000
-#endif
-// Not const: a threshold calibration (see runThresholdCal()) can replace
-// it at runtime, and the replacement is persisted to NVS and re-loaded at
-// boot — so a stored calibration OUTRANKS the -DLIGHT_THRESHOLD build
-// flag from then on. Read and written only on the UI task (measurement,
-// meter tick, calibration report, the load at task startup), so a plain
-// int is safe. 0 in NVS means "nothing stored, use the flag".
+// Not const: follows the active sensor config, and a threshold
+// calibration (see runThresholdCal()) can replace it at runtime — the
+// replacement is persisted per config ("thr0"/"thr1") and re-loaded by
+// activateSensor(), so a stored calibration OUTRANKS the config's
+// default from then on. Read and written only on the UI task
+// (measurement, meter tick, calibration report, activation), so a plain
+// int is safe. 0 in NVS means "nothing stored, use the default".
 static int lightThreshold = LIGHT_THRESHOLD;
 static const char *SENSOR_PREFS_NAMESPACE = "sensor";  // own namespace, same reasoning as "runlog"
-static const char *SENSOR_PREFS_THR_KEY = "thr";
+static const char *SENSOR_PREFS_CFG_KEY = "cfg";       // active config index
+
+static void sensorThrKey(uint8_t idx, char *out, size_t outLen) {
+  snprintf(out, outLen, "thr%u", (unsigned)idx);
+}
+
+// Make one config live: pins, attenuation, threshold (stored calibration
+// if any, the config's default otherwise), and — unless this is the boot
+// pass replaying a stored choice — persist the selection. UI task only.
+static void activateSensor(uint8_t idx, bool persist) {
+  if (idx >= SENSOR_COUNT) idx = 0;
+  activeSensor = idx;
+  const SensorConfig &c = SENSORS[idx];
+  analogSetPinAttenuation(c.pin, ADC_11db);  // full ~0-3.3V span
+  if (c.gndPin >= 0) {
+    // The sensor's ground is a GPIO held low (see the config table).
+    // Re-asserted on every activation — cheap, and it means switching
+    // away and back never leaves the diode floating. Nothing else may
+    // call pinMode() on this pin (the peripheral-manager rule from the
+    // old TEPT4400 pull-up gotcha still applies).
+    pinMode(c.gndPin, OUTPUT);
+    digitalWrite(c.gndPin, LOW);
+  }
+
+  lightThreshold = c.defaultThr;
+  char key[8];
+  sensorThrKey(idx, key, sizeof(key));
+  Preferences p;
+  if (p.begin(SENSOR_PREFS_NAMESPACE, false)) {
+    int stored = (int)p.getUInt(key, 0);
+    if (stored > 0 && stored < 4096) lightThreshold = stored;
+    if (persist) p.putUChar(SENSOR_PREFS_CFG_KEY, idx);
+    p.end();
+  }
+}
 
 // How long each of the threshold calibration's two captures samples for
 // (see runThresholdCal()). Unlike the measurement poll below, this loop
@@ -365,7 +412,7 @@ static volatile uint16_t autoTotal = 0;
 // menu state for the same reason MENU_DRIVE is one: while it is up,
 // boardMenuActive() keeps every press (the continue tap, the dismissing
 // tap, anything stray mid-capture) from also being a HID press.
-enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE, MENU_CAPTURE, MENU_VAL };
+enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE, MENU_CAPTURE, MENU_VAL, MENU_SENSOR };
 static volatile MenuState menuState = MENU_NONE;
 static int topIndex = 0;
 
@@ -379,6 +426,7 @@ enum TopItem : uint8_t {
   ITEM_METER,
   ITEM_AUTO,
   ITEM_VALIDATE,
+  ITEM_SENSOR,
   ITEM_DRIVE,
   ITEM_MODE,
   ITEM_PAIR,   // BLE modes only
@@ -386,7 +434,7 @@ enum TopItem : uint8_t {
   ITEM_KINDS,
 };
 static const char *TOP_ITEM_LABELS[ITEM_KINDS] = {
-  "Light meter", "Auto test", "Validate", "USB drive", "Change mode", "Pairing", "Exit"
+  "Light meter", "Auto test", "Validate", "Sensor", "USB drive", "Change mode", "Pairing", "Exit"
 };
 // Built once per boot by buildTopMenu(), from the mode. Fixed for the
 // life of the boot, exactly like the mode it is derived from, so nothing
@@ -452,6 +500,16 @@ struct History {
 };
 static History histRise;
 static History histFall;
+
+// Shared by the reset-stats hold and by switching sensor configs — both
+// mean "everything measured so far no longer applies".
+static void clearStats() {
+  lastLatencyUs = LAT_NONE;
+  statsRise = DirStats();
+  statsFall = DirStats();
+  histRise = History();
+  histFall = History();
+}
 
 // Which of the two top-strip views is up. Owned by uiTask, flipped only
 // from within the menu's "Light meter" item (see menuSelectRequested
@@ -537,7 +595,7 @@ static void runMeasurement(int64_t t0) {
   // direction. ~100us of reads, none of it in the reported figure — t0
   // is already fixed.
   int32_t baselineSum = 0;
-  for (int i = 0; i < 4; i++) baselineSum += analogRead(LIGHT_ANALOG_PIN);
+  for (int i = 0; i < 4; i++) baselineSum += analogRead(sensorPin());
   int baseline = baselineSum / 4;
   bool waitForRise = baseline < lightThreshold;
   int64_t deadline = t0 + (int64_t)MEASURE_TIMEOUT_MS * 1000;
@@ -549,7 +607,7 @@ static void runMeasurement(int64_t t0) {
   int64_t crossAt = 0;
   int run = 0;
   for (;;) {
-    int v = analogRead(LIGHT_ANALOG_PIN);
+    int v = analogRead(sensorPin());
     int64_t now = esp_timer_get_time();
 
     if (waitForRise ? (v >= lightThreshold) : (v < lightThreshold)) {
@@ -600,7 +658,7 @@ static void drawLightStrip(int raw, uint32_t mv) {
   uint16_t tickColor = display.color565(255, 190, 40);
 
   char buf[24];
-  snprintf(buf, sizeof(buf), "%4d  %u.%02uV", raw,
+  snprintf(buf, sizeof(buf), "%s %4d %u.%02uV", SENSORS[activeSensor].tag, raw,
            (unsigned)(mv / 1000), (unsigned)((mv % 1000) / 10));
 
   display.setFont(&fonts::Font2);
@@ -857,13 +915,13 @@ static void drawMenuTop() {
   display.setFont(&fonts::Font0);
   display.setTextDatum(textdatum_t::top_center);
 
-  // Seven items (a BLE mode's list, Validate included) no longer leave
-  // room for a heading: 12px pitch from y=8 puts the seventh row at
-  // y=80, with the hints at 96/108 below. The "MENU" title paid for the
-  // seventh row — the amber selection marker already says what screen
-  // this is. THIS is the panel full: an eighth item needs a scrolling
-  // menu, not another row.
-  const int rowH = 12;
+  // Eight items (a BLE mode's list, Validate and Sensor included) at
+  // 11px pitch from y=8 put the eighth row at y=85, Font0's 8px leaving
+  // three clear pixels per gap and the hints untouched at 96/108. The
+  // "MENU" heading went at seven items; the gap between rows went from
+  // four pixels to three at eight. THIS is genuinely the panel full: a
+  // ninth item needs a scrolling menu — there is nothing left to shave.
+  const int rowH = 11;
   const int top = 8;
   char buf[24];
   for (int i = 0; i < numTopItems; i++) {
@@ -1084,7 +1142,7 @@ static void capturePhase(int phase, uint16_t *hist, CapSet &out) {
   for (;;) {
     uint32_t elapsed = millis() - start;
     if (elapsed >= SENSOR_CAPTURE_MS) break;
-    int v = analogRead(LIGHT_ANALOG_PIN);
+    int v = analogRead(sensorPin());
     if (v < 0) v = 0;
     if (v > 4095) v = 4095;
     hist[v]++;
@@ -1193,7 +1251,7 @@ static void validationIdleWatch() {
   while ((uint32_t)(millis() - start) < LIGHT_PERIOD_MS) {
     if (measurePending || resetRequested || enterMenuRequested ||
         menuTapRequested || menuSelectRequested) return;
-    int side = (analogRead(LIGHT_ANALOG_PIN) >= lightThreshold) ? 1 : 0;
+    int side = (analogRead(sensorPin()) >= lightThreshold) ? 1 : 0;
     if (valIdleSide < 0) {
       valIdleSide = side;
       valIdleRun = 0;
@@ -1221,7 +1279,7 @@ static void runValidatedMeasurement(int64_t t0) {
   val.presses++;
 
   int32_t baselineSum = 0;
-  for (int i = 0; i < 4; i++) baselineSum += analogRead(LIGHT_ANALOG_PIN);
+  for (int i = 0; i < 4; i++) baselineSum += analogRead(sensorPin());
   int baseline = baselineSum / 4;
   bool waitForRise = baseline < lightThreshold;
   int64_t deadline = t0 + (int64_t)MEASURE_TIMEOUT_MS * 1000;
@@ -1231,7 +1289,7 @@ static void runValidatedMeasurement(int64_t t0) {
   bool crossed = false;
   uint32_t us = 0;
   for (;;) {
-    int v = analogRead(LIGHT_ANALOG_PIN);
+    int v = analogRead(sensorPin());
     int64_t now = esp_timer_get_time();
     if (waitForRise ? (v >= lightThreshold) : (v < lightThreshold)) {
       if (run == 0) crossAt = now;
@@ -1261,7 +1319,7 @@ static void runValidatedMeasurement(int64_t t0) {
   int erun = 0;
   uint32_t postStart = millis();
   while ((uint32_t)(millis() - postStart) < VAL_POSTWATCH_MS) {
-    int v = analogRead(LIGHT_ANALOG_PIN);
+    int v = analogRead(sensorPin());
     int es = (v >= lightThreshold) ? 1 : 0;
     if (es != side) {
       if (++erun >= MEASURE_CONFIRM) {
@@ -1388,6 +1446,40 @@ static void drawCaptureResult() {
   display.drawString("tap: done", SCREEN_W / 2, 112);
 }
 
+// MENU_SENSOR: the sensor picker. Tap applies AND persists the next
+// config on the spot — pins re-driven, threshold reloaded from that
+// config's own calibration slot — so the hold that follows is only ever
+// "I'm done looking". Switching clears the stats and histogram, since
+// one sensor's numbers mean nothing against another's; that side effect
+// is printed on the screen rather than left to be discovered.
+static void drawMenuSensor() {
+  uint16_t dim = dimColor();
+  char buf[28];
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  display.drawString("SENSOR", SCREEN_W / 2, 6);
+
+  display.setTextDatum(textdatum_t::middle_center);
+  display.setTextColor(riseColor(), black());
+  display.setFont(&fonts::Font4);
+  if (display.textWidth(SENSORS[activeSensor].name) > SCREEN_W - 8) {
+    display.setFont(&fonts::Font2);
+  }
+  display.drawString(SENSORS[activeSensor].name, SCREEN_W / 2, 46);
+
+  display.setFont(&fonts::Font0);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(dim, black());
+  snprintf(buf, sizeof(buf), "pin %u  threshold %d",
+           SENSORS[activeSensor].pin, lightThreshold);
+  display.drawString(buf, SCREEN_W / 2, 66);
+  display.drawString("switching clears stats", SCREEN_W / 2, 80);
+  display.drawString("tap: next", SCREEN_W / 2, 96);
+  display.drawString("hold: done", SCREEN_W / 2, 108);
+}
+
 static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung hint,
                       LinkState link) {
   display.startWrite();
@@ -1405,6 +1497,8 @@ static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung 
     drawCaptureResult();
   } else if (menuState == MENU_VAL) {
     drawValReport();
+  } else if (menuState == MENU_SENSOR) {
+    drawMenuSensor();
   } else {
     drawTopStrip(raw, mv);
     drawModeLine(active, link);
@@ -1423,30 +1517,19 @@ static void uiTaskFn(void *) {
   // is about to start polling the button.
   displayReady = display.init();
   if (displayReady) display.setBrightness(BRIGHTNESS);
-  analogSetPinAttenuation(LIGHT_ANALOG_PIN, ADC_11db);  // full ~0-3.3V span
   {
-    // A previously calibrated threshold, if any, wins over the build
-    // flag. Loaded here — before the first press could possibly be
-    // measured — and range-checked so a corrupt value falls back to the
-    // flag rather than pinning measurements against a rail.
+    // Replay the persisted sensor selection — pins, ground, threshold,
+    // the lot — before the first press could possibly be measured. The
+    // default (index 0, Unit Light) is what a fresh device gets, which
+    // is why the safe-with-nothing-wired config has to be index 0.
+    uint8_t storedCfg = 0;
     Preferences p;
     if (p.begin(SENSOR_PREFS_NAMESPACE, true)) {
-      int stored = (int)p.getUInt(SENSOR_PREFS_THR_KEY, 0);
-      if (stored > 0 && stored < 4096) lightThreshold = stored;
+      storedCfg = p.getUChar(SENSOR_PREFS_CFG_KEY, 0);
       p.end();
     }
+    activateSensor(storedCfg, false);
   }
-#if LIGHT_GND_PIN >= 0
-  // The sensor's ground is a GPIO held low (see the sensor knobs above).
-  // Done once, here, and no code may call pinMode() on this pin again —
-  // same peripheral-manager rule as the old TEPT4400 pull-up (see the
-  // CLAUDE.md gotcha): a later pinMode() would reconfigure the pin and
-  // silently drop the drive. Until this line runs the pin floats and the
-  // sensor reads garbage; that window ends before the first press can be
-  // measured, since this task starts before loop()'s first pass matters.
-  pinMode(LIGHT_GND_PIN, OUTPUT);
-  digitalWrite(LIGHT_GND_PIN, LOW);
-#endif
 
   // Mount here and nowhere else. This is the one moment in the firmware's
   // life when a flash operation is harmless: USB is already up (main.cpp
@@ -1510,11 +1593,7 @@ static void uiTaskFn(void *) {
     bool statsCleared = false;
     if (resetRequested) {
       resetRequested = false;
-      lastLatencyUs = LAT_NONE;
-      statsRise = DirStats();
-      statsFall = DirStats();
-      histRise = History();
-      histFall = History();
+      clearStats();
       statsCleared = true;
     }
     // Menu requests, likewise deferred here rather than acted on where
@@ -1536,6 +1615,14 @@ static void uiTaskFn(void *) {
         // Persisted on the spot, exactly like the mode picker's tap —
         // so the hold that follows is only ever "I'm done looking".
         appSetStorageArmed(!appStorageArmed());
+      } else if (menuState == MENU_SENSOR) {
+        // Applied and persisted per tap, same idiom as the other
+        // pickers. Stats go with the old sensor — one circuit's numbers
+        // mean nothing against another's — and statsCleared makes the
+        // main screen redraw honest once the picker is left.
+        activateSensor((activeSensor + 1) % SENSOR_COUNT, true);
+        clearStats();
+        statsCleared = true;
       }
       else if (menuState == MENU_CAPTURE || menuState == MENU_VAL) {
         menuState = MENU_NONE;  // the reports have one job: be read, then leave
@@ -1586,6 +1673,7 @@ static void uiTaskFn(void *) {
             appStartValidation();
             menuState = MENU_NONE;
             break;
+          case ITEM_SENSOR: menuState = MENU_SENSOR; break;
           case ITEM_DRIVE: menuState = MENU_STORAGE; break;
           case ITEM_MODE:  menuState = MENU_MODE; break;
           // Pairing has no picker of its own and nothing to confirm: it
@@ -1601,9 +1689,9 @@ static void uiTaskFn(void *) {
           default: break;
         }
       } else if (menuState == MENU_MODE || menuState == MENU_STORAGE ||
-                 menuState == MENU_VAL) {
+                 menuState == MENU_VAL || menuState == MENU_SENSOR) {
         // The pickers persist per tap and the validation report is only
-        // a report — in all three, a hold just leaves.
+        // a report — in all four, a hold just leaves.
         menuState = MENU_NONE;
       } else if (menuState == MENU_CAPTURE) {
         // On the report, hold means "use it": the calibrated threshold
@@ -1615,9 +1703,11 @@ static void uiTaskFn(void *) {
         // outstanding; the same licence the pairing item has.
         if (cal.done && cal.thr > 0 && cal.thr < 4096) {
           lightThreshold = cal.thr;
+          char key[8];
+          sensorThrKey(activeSensor, key, sizeof(key));  // a calibration belongs to its sensor
           Preferences p;
           if (p.begin(SENSOR_PREFS_NAMESPACE, false)) {
-            p.putUInt(SENSOR_PREFS_THR_KEY, (uint32_t)cal.thr);
+            p.putUInt(key, (uint32_t)cal.thr);
             p.end();
           }
         }
@@ -1687,8 +1777,8 @@ static void uiTaskFn(void *) {
       uint32_t now = millis();
       if (shownRaw < 0 || (uint32_t)(now - lastSampleMs) >= LIGHT_PERIOD_MS) {
         lastSampleMs = now;
-        raw = analogRead(LIGHT_ANALOG_PIN);
-        mv = analogReadMilliVolts(LIGHT_ANALOG_PIN);
+        raw = analogRead(sensorPin());
+        mv = analogReadMilliVolts(sensorPin());
         // Repaint only once the reading has actually moved — the bottom
         // few ADC counts are noise, and repainting on every one of them
         // would just make the number flicker.
@@ -2030,6 +2120,7 @@ static void buildTopMenu(Mode active) {
   topItems[numTopItems++] = ITEM_METER;
   topItems[numTopItems++] = ITEM_AUTO;
   topItems[numTopItems++] = ITEM_VALIDATE;
+  topItems[numTopItems++] = ITEM_SENSOR;
   topItems[numTopItems++] = ITEM_DRIVE;
   topItems[numTopItems++] = ITEM_MODE;
   if (modeIsBle(active)) topItems[numTopItems++] = ITEM_PAIR;

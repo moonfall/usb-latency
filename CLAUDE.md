@@ -532,22 +532,30 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   Caveat not yet checked on hardware: the unit is a 5V part, so if its
   analog swing really does reach 5V it will clip at the ADC's ~3.3V
   ceiling (4095) rather than damaging anything visible in the reading.
-- **The sensor pin, and an optional GPIO-as-ground, are build flags —
-  `-DLIGHT_SENSOR_PIN=<gpio>` (default 1, the Grove analog line) and
-  `-DLIGHT_GND_PIN=<gpio>` (default -1, none).** Added for a bare BPW34
-  photodiode in photovoltaic mode straddling the bottom pads: its 5.08mm
-  lead pitch lands on G6 and G8 exactly (two 2.54mm pads, legs clearing
-  G7), so `-DLIGHT_SENSOR_PIN=6 -DLIGHT_GND_PIN=8 -DLIGHT_THRESHOLD=300`
-  gives anode→G6, cathode→G8-driven-LOW with no other components. A GPIO
-  held low is a real ground at photodiode currents (µA across tens of
-  ohms of Rds(on) = µV of error); both pins are ADC1-capable and
-  non-strapping so the roles swap freely — a meter view pinned near zero
-  under bright light means the diode is backwards, swap the flags not the
-  solder. The ~300 threshold is not optional: photovoltaic mode tops out
-  at ~0.35–0.45V (~300–500 counts) and can never reach the Unit Light's
-  3000. Same pinMode-once rule as the old TEPT4400 pull-up applies to the
-  ground pin. Compile-verified in both the default and the BPW34 flag
-  combination; not yet run on hardware.
+- **Sensor configurations are a runtime picker now — the
+  `-DLIGHT_SENSOR_PIN`/`-DLIGHT_GND_PIN` build knobs are GONE** (they
+  required a reflash to swap sensors, exactly the wrong shape once two
+  sensors were wired at once). The `SENSORS[]` table in
+  `board_atoms3r.cpp` holds the configs: [0] Unit Light (Grove analog on
+  GPIO1, default threshold `LIGHT_THRESHOLD` 3000) and [1] BPW34 (bare
+  photodiode straddling the bottom pads — 5.08mm lead pitch lands anode
+  on G6/sense, cathode on G8, which `activateSensor()` drives LOW as a
+  virtual ground; default threshold `BPW34_THRESHOLD` 250, photovoltaic
+  swing tops out ~0.35–0.45V). The menu's `Sensor` item cycles configs,
+  applying and persisting per tap (NVS `sensor`/`cfg`) and clearing the
+  stats/histogram, since one circuit's numbers mean nothing against
+  another's. Index 0 must stay the sensor a fresh device is assumed to
+  have: a stored selection of unwired hardware reads a floating pin, so
+  the safe config is what NVS-less boots get. **Calibrated thresholds
+  are per-config** — NVS keys `thr0`/`thr1`, loaded by
+  `activateSensor()`, written by the calibration report's hold — one
+  global key would let calibrating one sensor clobber the other's. (The
+  old global `thr` key is simply ignored now; a leftover value there
+  does nothing.) A meter view pinned near zero in bright light on the
+  BPW34 config means the diode is backwards — swap the legs. The
+  pinMode-exactly-once peripheral-manager rule still applies to the
+  ground pin, with the one licensed exception that `activateSensor()`
+  itself re-asserts OUTPUT/LOW on every activation.
 - **The on-screen numbers don't update until the measurement finishes.**
   This is deliberate, not a dropped frame: the UI task must not be
   pushing pixels over SPI while it is sampling the sensor, because a
@@ -1017,7 +1025,8 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   alongside the validation mode) — if a measurement-path hardening ever
   looks missing, check whether it lives on an unmerged branch before
   re-deriving it.
-- **The top menu is at seven rows, its hard ceiling.** The "MENU" heading
-  was dropped to make room for the seventh (Validate): 12px pitch from
-  y=8 puts row seven at y=80, hints at 96/108. An eighth item needs a
-  scrolling menu, not another row.
+- **The top menu is at eight rows, its hard ceiling.** The "MENU" heading
+  went at seven items (Validate); the row pitch dropped 12px→11px at
+  eight (Sensor), putting row eight at y=85 with three clear pixels per
+  gap and the hints untouched at 96/108. There is nothing left to shave:
+  a ninth item needs a scrolling menu, not another row.
