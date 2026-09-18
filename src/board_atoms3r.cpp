@@ -288,6 +288,17 @@ static void activateSensor(uint8_t idx, bool persist) {
 #define SENSOR_CAPTURE_MS 10000
 #endif
 
+// Positioning time between the hold that selects the calibration and the
+// first sample of capture 1. The button is the screen face, so at the
+// instant the flow starts the user's hand is still on the device they
+// now have to aim a sensor at; without this, capture 1's opening second
+// is a measurement of a finger moving away rather than of the display
+// state being characterised. Same reason as the automated test's
+// AUTO_START_DELAY_MS in main.cpp, minus the aliasing argument — this
+// capture is a level statistic, not a timing one, so a fixed wait costs
+// it nothing.
+static const uint32_t CAL_START_DELAY_MS = 1000;
+
 // How long to wait for the display to respond before giving up. Also the
 // longest this task can hold core 0 without letting its idle task run —
 // keep it well under the 5s task watchdog.
@@ -1111,6 +1122,25 @@ static void drawCaptureProgress(int phase, uint32_t elapsedMs, uint16_t curMin, 
   display.endWrite();
 }
 
+// The positioning pause before capture 1. A frame of its own rather than
+// a state inside drawCaptureProgress(): nothing is being sampled yet, and
+// a "0s/10s" line on screen would be saying otherwise.
+static void drawCaptureReady() {
+  display.startWrite();
+  display.fillScreen(black());
+  display.setFont(&fonts::Font2);
+  display.setTextDatum(textdatum_t::top_center);
+  display.setTextColor(display.color565(255, 190, 40), black());
+  display.drawString("GET READY", SCREEN_W / 2, 20);
+  display.setFont(&fonts::Font0);
+  display.setTextColor(dimColor(), black());
+  display.drawString("aim the sensor at the", SCREEN_W / 2, 52);
+  display.drawString("display and let go", SCREEN_W / 2, 68);
+  display.setTextColor(riseColor(), black());
+  display.drawString("capture 1 in 1s", SCREEN_W / 2, 90);
+  display.endWrite();
+}
+
 static void drawCapturePrompt(const CapSet &first) {
   display.startWrite();
   display.fillScreen(black());
@@ -1180,6 +1210,14 @@ static void capturePhase(int phase, uint16_t *hist, CapSet &out) {
 // phase 2 on its own.
 static void runThresholdCal() {
   CapSet a, b;
+
+  // Let go and aim before anything is sampled. vTaskDelay rather than a
+  // busy wait for the same reason capturePhase() yields every sample:
+  // this task must not hold core 0 solid, and there is nothing to do
+  // here but wait.
+  drawCaptureReady();
+  vTaskDelay(pdMS_TO_TICKS(CAL_START_DELAY_MS));
+
   capturePhase(1, capHistA, a);
 
   drawCapturePrompt(a);

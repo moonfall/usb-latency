@@ -122,7 +122,9 @@ rather than re-checked live.
 to five minutes of sending nothing, ending in an empty file, is not a
 kinder failure than saying no) and stops itself if the link drops
 mid-run, writing out what it had. Otherwise it runs
-`AUTO_TEST_ITERATIONS` (500) presses in the current mode unattended, spaced by a random 200-500ms gap — roughly three to five
+`AUTO_TEST_ITERATIONS` (500) presses in the current mode unattended, spaced by a random 200-500ms gap, with a further fixed
+`AUTO_START_DELAY_MS` (1s) added to the first gap only so there is always
+at least a second to let go and aim the sensor — roughly three to five
 minutes, abortable at any point with a press — each going through exactly
 the same send-and-measure path a real button press does. It lives in
 `main.cpp` (`serviceAutoTest()`), not the board layer, because only
@@ -657,6 +659,13 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   randomised too rather than firing immediately, because the button *is*
   the screen face, inches from wherever the sensor is aimed: the instant
   the user lets go of it is exactly the wrong time to take a reading.
+  That first gap additionally carries a fixed `AUTO_START_DELAY_MS` (1s)
+  on top of the random part — *added*, not substituted, so the guarantee
+  of a second's positioning time doesn't cost the first press of every
+  run its random phase within a frame. It goes into `runGapMs` rather
+  than only into the deadline, so the run file's `gap_ms` for row 1 is
+  the gap that actually preceded it. A validation run shares this pacing
+  and so gets the same 1s.
 - **No flash write may happen while a run is in progress — and this is
   not a performance nicety.** An erase or program cycle on the ESP32-S3's
   SPI flash stalls the flash cache, which stalls instruction fetch on
@@ -978,7 +987,13 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   user arranges the display state by hand between phases, and a press
   that also clicked would flip the state they just set up (the opposite
   choice from the old design, which relied on presses flipping the
-  display mid-capture). `runThresholdCal()` blocks on the UI task
+  display mid-capture). A `GET READY` frame and a `CAL_START_DELAY_MS`
+  (1s) `vTaskDelay` sit between the selecting hold and capture 1's first
+  sample, for the same reason the automated test has one: the hand that
+  selected the item is still on the screen face the sensor is aimed at,
+  and capture 1 would otherwise open by characterising a finger. Capture
+  2 has none — it is started by a deliberate tap, with the display state
+  already arranged. `runThresholdCal()` blocks on the UI task
   through both captures and the inter-phase wait, polling the tap
   request flag that core 1 sets; the request flags are cleared before
   the wait and again after the flow, so a tap queued during either
@@ -996,7 +1011,8 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   what makes the plain `int` safe.
 - **The "Validate" menu item is the diagnostic for impossibly-fast
   detections, and its idle-flip counter is the number to look at first.**
-  A validation run is 20 presses with 1.5-3s settling gaps (main.cpp
+  A validation run is 20 presses with 1.5-3s settling gaps, the first of
+  them plus the shared 1s start delay (main.cpp
   paces it through the same machinery as the auto test; see
   `appStartValidation()`), during which the board watches the sensor the
   whole time: between presses the UI task's wait is replaced by ~1kHz

@@ -216,6 +216,18 @@ static const uint32_t AUTO_GAP_MAX_MS = 500;
 // sample. Comfortably above the board's own measurement timeout.
 static const uint32_t AUTO_HOLD_MAX_MS = 1000;
 
+// Positioning time, added to the gap before the *first* press of a run
+// (auto test and validation alike). The run is selected by a 1s hold on
+// the device itself, so the moment it starts is the moment the user's
+// hand is still on the thing they now have to aim at a display — a
+// guaranteed second of doing nothing is what lets them let go, settle
+// the sensor and get out of the way. It is *added* to the random first
+// gap rather than replacing it: the randomness is there to stop presses
+// aliasing with the display's refresh cadence (see the random-gap
+// gotcha) and a fixed 1s start would put the first sample of every run
+// at the same phase within a frame.
+static const uint32_t AUTO_START_DELAY_MS = 1000;
+
 static const char *PREFS_NAMESPACE = "usbmode";
 static const char *PREFS_KEY = "mode";
 // Whether the next boot should come up as a USB drive instead of a HID
@@ -1124,8 +1136,12 @@ static void serviceAutoTest(uint32_t now) {
     // A normal gap before the first press too, rather than firing the
     // instant the button comes up: the button is the screen face, inches
     // from wherever the sensor is aimed, so letting go of it is exactly
-    // the moment not to be taking a reading.
-    runGapMs = autoGapMs();
+    // the moment not to be taking a reading. Plus AUTO_START_DELAY_MS on
+    // top of it, so that "not immediately" has a floor rather than being
+    // whatever the die rolled. It goes into runGapMs rather than only
+    // into autoResumeAtMs so the run file records the gap that actually
+    // preceded the first sample.
+    runGapMs = autoGapMs() + AUTO_START_DELAY_MS;
     autoResumeAtMs = now + runGapMs;
     boardShowAutoTest(0, runIterations());
   }
