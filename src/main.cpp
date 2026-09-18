@@ -230,6 +230,32 @@ static const uint32_t AUTO_START_DELAY_MS = 1000;
 
 static const char *PREFS_NAMESPACE = "usbmode";
 static const char *PREFS_KEY = "mode";
+
+// --- Full test ---------------------------------------------------------
+// One auto test in each of the six modes in turn, rebooting between
+// steps because a mode IS a boot (the descriptor rule). Progress lives
+// in NVS so each boot resumes: fullstep = 0-based index of the step
+// currently owed (absent/>=6 = no test), fullstart = the mode the test
+// began in (steps run (fullstart + step) % MODE_COUNT), fullid = a
+// counter naming the test in every step's CSV.
+static const char *PREFS_FULL_STEP_KEY = "fullstep";
+static const char *PREFS_FULL_START_KEY = "fullstart";
+static const char *PREFS_FULL_ID_KEY = "fullid";
+static const uint8_t FULL_TEST_STEPS = MODE_COUNT;  // all six modes
+// "A few seconds for the input device to properly be enumerated": fixed
+// settle after boot before the step's run starts. BLE steps additionally
+// wait for a subscribed host, up to FULL_LINK_TIMEOUT_MS — a host that
+// never reconnects would otherwise hang the test forever, and aborting
+// with a partial set beats hanging.
+static const uint32_t FULL_SETTLE_MS = 5000;
+static const uint32_t FULL_LINK_TIMEOUT_MS = 20000;
+// Consecutive timeouts that make a step a failed test: if the display
+// stops responding, every remaining press would time out too, and 500 x
+// 500ms of that is four minutes of measuring nothing.
+static const uint8_t FULL_MAX_CONSEC_TIMEOUTS = 5;
+// Pause between "step done, file written" and the restart, so the reboot
+// isn't jarring and the button-released guard has a moment to matter.
+static const uint32_t FULL_REBOOT_PAUSE_MS = 750;
 // Whether the next boot should come up as a USB drive instead of a HID
 // device. A key of its own rather than a fourth value in PREFS_KEY: the
 // HID mode has to go on being remembered while storage is armed, or
@@ -286,6 +312,24 @@ static uint32_t autoResumeAtMs = 0;
 static volatile bool autoStartRequested = false;
 static volatile bool autoIsValidation = false;  // set with autoStartRequested, same core
 static bool pressAbortedAuto = false;  // this press stopped a run and sends nothing
+
+// Full-test runtime state, mirroring the NVS keys above.
+enum FullPhase : uint8_t { FULL_OFF, FULL_SETTLE, FULL_RUNNING, FULL_REBOOTING };
+static FullPhase fullPhase = FULL_OFF;
+static uint8_t fullStep = 0;      // 0-based step being executed
+static uint8_t fullStart = 0;     // mode the test began in
+static uint32_t fullId = 0;
+static uint32_t fullSettleAtMs = 0;
+static uint32_t fullLinkDeadlineMs = 0;
+static uint32_t fullRebootAtMs = 0;
+static uint8_t fullConsecTimeouts = 0;
+static bool fullRunStarted = false;  // the step's run actually began (vs. was refused)
+
+// Captured at run START so a file written after the test state changed
+// (aborted, cleared) still carries the tag of the test it belonged to.
+static uint32_t runFullId = 0;
+static uint8_t runFullStep = 0;
+static uint8_t runFullTotal = 0;
 
 // --- Recording a run --------------------------------------------------
 // Every run is written out as a file when it ends (see board.h's
@@ -1029,6 +1073,15 @@ static void collectSample() {
   s.gapMs = runGapMs;
   s.rise = sampleRise;
   s.timedOut = sampleTimedOut;
+
+  // The full test's "display stopped responding" detector: a streak of
+  // timeouts means every remaining press would measure nothing, so the
+  // step — and with it the test — is declared failed at the streak
+  // threshold rather than four minutes later. Counted here because this
+  // is the one place every recorded sample passes through on core 1.
+  if (fullPhase == FULL_RUNNING) {
+    fullConsecTimeouts = s.timedOut ? (uint8_t)(fullConsecTimeouts + 1) : 0;
+  }
 }
 
 // Random rather than fixed, and this is the whole point of the gap: a
@@ -1064,6 +1117,126 @@ static void stopAutoTest() {
   // The write itself waits — see runFlushPending, and finishRun() below.
   runAborted = true;
   runFlushPending = true;
+}
+
+// Ends the full test, however it ends: NVS state gone so no future boot
+// resumes it, indicator off. The step's partial file (if a run was in
+// flight) is not this function's business — runFlushPending machinery
+// still writes it, tagged, because the tag was captured at run start.
+static void fullAbort() {
+  if (fullPhase == FULL_OFF) return;
+  fullPhase = FULL_OFF;
+  prefs.remove(PREFS_FULL_STEP_KEY);
+  boardShowFullTest(0, 0);
+}
+
+void appStartFullTest() {
+  if (autoPhase != AUTO_OFF || fullPhase != FULL_OFF) return;  // one at a time
+  // An armed USB-drive flag would hijack the first reboot into a
+  // storage boot and strand the test — full test and drive arming are
+  // mutually exclusive by construction.
+  appSetStorageArmed(false);
+  fullStart = (uint8_t)activeMode;
+  fullStep = 0;
+  fullId = prefs.getUInt(PREFS_FULL_ID_KEY, 0) + 1;
+  prefs.putUInt(PREFS_FULL_ID_KEY, fullId);
+  prefs.putUChar(PREFS_FULL_START_KEY, fullStart);
+  prefs.putUChar(PREFS_FULL_STEP_KEY, 0);
+  fullConsecTimeouts = 0;
+  fullRunStarted = false;
+  fullPhase = FULL_RUNNING;   // step 0 runs in the current boot, no reboot needed
+  boardShowFullTest(1, FULL_TEST_STEPS);
+  autoIsValidation = false;
+  autoStartRequested = true;
+}
+
+// The full test's own pacing, called every loop() pass after
+// serviceAutoTest(). It owns everything between runs: the settle wait
+// after a boot, noticing a step's run finishing, and the reboot into the
+// next mode.
+static void serviceFullTest(uint32_t now) {
+  switch (fullPhase) {
+    case FULL_OFF:
+      return;
+
+    case FULL_SETTLE:
+      // Fixed settle first ("a few seconds to be enumerated"), then for
+      // BLE steps also an actual subscribed host — advertising alone
+      // sends nothing. A host that never comes back would hang the test
+      // forever; aborting with a partial set of files beats hanging.
+      if ((int32_t)(now - fullSettleAtMs) < 0) return;
+      if (modeIsBle(activeMode) && !appCanSendInput()) {
+        if ((int32_t)(now - fullLinkDeadlineMs) >= 0) fullAbort();
+        return;
+      }
+      fullConsecTimeouts = 0;
+      fullRunStarted = false;
+      fullPhase = FULL_RUNNING;
+      autoIsValidation = false;
+      autoStartRequested = true;
+      return;
+
+    case FULL_RUNNING:
+      if (autoPhase != AUTO_OFF) {
+        fullRunStarted = true;
+        return;
+      }
+      // Not running (any more, or yet). Wait out the start handshake and
+      // the file write before judging the outcome.
+      if (autoStartRequested || runFlushPending || runAwaitSample) return;
+      if (!fullRunStarted) {
+        // The run was refused at start (e.g. the BLE link dropped in the
+        // gap between the settle check and the start) — that step cannot
+        // be tested, so the test is over.
+        fullAbort();
+        return;
+      }
+      if (runAborted) {
+        // Button or consecutive-timeout abort: the press path / timeout
+        // check already called fullAbort(), but a belt-and-braces clear
+        // here costs nothing if some future abort path forgets.
+        fullAbort();
+        return;
+      }
+      // Step complete, file written. Last step? Done. Otherwise arm the
+      // next mode and reboot into it.
+      if (fullStep + 1 >= FULL_TEST_STEPS) {
+        fullAbort();  // same cleanup; "abort" after the last step IS completion
+        return;
+      }
+      {
+        uint8_t nextStep = fullStep + 1;
+        Mode nextMode = (Mode)((fullStart + nextStep) % MODE_COUNT);
+        prefs.putUChar(PREFS_KEY, (uint8_t)nextMode);
+        prefs.putUChar(PREFS_FULL_STEP_KEY, nextStep);
+        pendingMode = nextMode;  // keep what the screen would say truthful
+        fullPhase = FULL_REBOOTING;
+        fullRebootAtMs = now + FULL_REBOOT_PAUSE_MS;
+      }
+      return;
+
+    case FULL_REBOOTING:
+      if ((int32_t)(now - fullRebootAtMs) < 0) return;
+      if (stableState) {
+        // Never restart with the button down. On this board GPIO0 isn't
+        // the button, but a press mid-test means "stop" everywhere else
+        // in the test, and it means it here too.
+        fullAbort();
+        return;
+      }
+      // THE one licensed ESP.restart() in this project, and the standing
+      // never-reboot-from-code gotcha needs answering head-on: that rule
+      // exists because on the S3-Zero the button IS GPIO0, the chip's
+      // boot-strapping pin, and the old hold-to-cycle gesture guaranteed
+      // it was held low at the moment of restart. None of that is
+      // reachable here: the full test exists only on the AtomS3R (menu +
+      // sensor), whose button is GPIO41 and whose GPIO0 is the LP5562's
+      // I2C clock — idle HIGH between transactions, and no transaction
+      // runs at this moment (backlight is set once at boot). The guard
+      // above additionally refuses to restart under any press at all.
+      ESP.restart();
+      return;
+  }
 }
 
 void appStartAutoTest() {
@@ -1179,6 +1352,9 @@ static void finishRun() {
   rec.count = runCount;
   rec.aborted = runAborted;
   rec.samples = runSamples;
+  rec.fullTestId = runFullId;
+  rec.fullStep = runFullStep;
+  rec.fullTotal = runFullTotal;
   boardWriteRun(rec);
 }
 
@@ -1212,6 +1388,12 @@ static void serviceAutoTest(uint32_t now) {
     runCount = 0;
     runAborted = false;
     runRecording = true;
+    // Full-test membership is captured NOW, not at write time: an
+    // aborted test clears the full state before the file goes out, and
+    // the file must still say which test the step belonged to.
+    runFullTotal = (fullPhase != FULL_OFF) ? FULL_TEST_STEPS : 0;
+    runFullStep = fullStep + 1;
+    runFullId = fullId;
     sampleReady = false;  // anything left over belongs to a manual press
     // A normal gap before the first press too, rather than firing the
     // instant the button comes up: the button is the screen face, inches
@@ -1278,6 +1460,18 @@ static void serviceAutoTest(uint32_t now) {
       // this sample is already in the stash, still paired with the gap
       // that preceded this press.
       collectSample();
+
+      if (fullPhase == FULL_RUNNING && fullConsecTimeouts >= FULL_MAX_CONSEC_TIMEOUTS) {
+        // Failed step: stop the run (partial file still written, tagged)
+        // and end the whole test — no reboot into a mode that would fail
+        // the same way against an unresponsive display.
+        autoPhase = AUTO_OFF;
+        boardShowAutoTest(0, 0);
+        runAborted = true;
+        runFlushPending = true;
+        fullAbort();
+        return;
+      }
 
       if (autoDone >= runIterations()) {
         autoPhase = AUTO_OFF;
@@ -1386,6 +1580,35 @@ void setup() {
   // stack's RAM cost off every other boot despite it being linked in
   // unconditionally.
   bleBegin(activeMode);
+
+  // A full test in flight resumes here: the previous step's completion
+  // wrote the next step's mode into the mode key and bumped fullstep
+  // before rebooting, so this boot IS the next step — all that's left is
+  // the settle wait, which serviceFullTest() owns. Placed after
+  // bleBegin() so a BLE step's link-wait clock starts with the radio
+  // actually advertising. Gated on boardHasSensor() so a stale flag can
+  // never make the S3-Zero (which has no full test) act on it; never
+  // resumed in a storage boot, where there is no HID to test.
+  {
+    uint8_t storedStep = prefs.getUChar(PREFS_FULL_STEP_KEY, 0xFF);
+    if (storedStep < FULL_TEST_STEPS && boardHasSensor() &&
+        activeMode != MODE_STORAGE) {
+      fullStep = storedStep;
+      fullStart = prefs.getUChar(PREFS_FULL_START_KEY, 0);
+      fullId = prefs.getUInt(PREFS_FULL_ID_KEY, 0);
+      fullPhase = FULL_SETTLE;
+      uint32_t bootNow = millis();
+      fullSettleAtMs = bootNow + FULL_SETTLE_MS;
+      fullLinkDeadlineMs = bootNow + FULL_LINK_TIMEOUT_MS;
+      boardShowFullTest(fullStep + 1, FULL_TEST_STEPS);
+    } else if (storedStep != 0xFF && storedStep >= FULL_TEST_STEPS) {
+      // A corrupt step value: clear rather than carry a flag that will
+      // never resolve. (A storage boot deliberately KEEPS a valid flag —
+      // the user detoured to fetch files; the test resumes on the next
+      // HID boot.)
+      prefs.remove(PREFS_FULL_STEP_KEY);
+    }
+  }
 }
 
 void loop() {
@@ -1407,13 +1630,17 @@ void loop() {
       // Three mutually exclusive things a press can be, decided here once
       // and remembered for the rest of this hold (see wasMenuActiveAtPress
       // above for why the decision can't be re-made at release time).
-      pressAbortedAuto = (autoPhase != AUTO_OFF);
+      // A press during a full test aborts the WHOLE test, not just a
+      // run — including during the settle wait between steps, when no
+      // run is active but the test very much is.
+      pressAbortedAuto = (autoPhase != AUTO_OFF) || (fullPhase != FULL_OFF);
       wasMenuActiveAtPress = !pressAbortedAuto && boardHasSensor() && boardMenuActive();
 
       if (pressAbortedAuto) {
         // Abort gesture, nothing else: no HID report, no hold ladder, or
         // the act of stopping a run would land in that run's own data.
-        stopAutoTest();
+        if (autoPhase != AUTO_OFF) stopAutoTest();
+        fullAbort();
       } else if (wasMenuActiveAtPress) {
         // Presses inside the menu are navigation only — no HID report,
         // no measurement. Tap vs. hold-to-select is resolved on release
@@ -1458,6 +1685,7 @@ void loop() {
   // Runs whether or not the button is down — a run proceeds with nobody
   // touching the device, so this has to come before the released-early-out.
   serviceAutoTest(now);
+  serviceFullTest(now);
   // Likewise: the calibration's press is made while the user is holding
   // nothing, and the board's UI task is blocked waiting for it.
   serviceCalPress(now);

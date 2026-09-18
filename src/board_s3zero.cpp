@@ -100,6 +100,10 @@ void boardMenuSelect() {}
 // No sensor means no measurement to be busy with, and no menu means the
 // automated test can never be started here in the first place.
 bool boardMeasurementBusy() { return false; }
+void boardShowFullTest(uint8_t step, uint8_t total) {
+  (void)step;
+  (void)total;  // no screen; and with no sensor, no full test ever starts here
+}
 void boardShowAutoTest(uint16_t done, uint16_t total) {
   (void)done;
   (void)total;

@@ -195,6 +195,21 @@ void appSetPendingMode(Mode mode);
 // never calls this.
 void appStartAutoTest();
 
+// Implemented in main.cpp; called by the menu's "Full test" item. Runs
+// the auto test in every one of the six modes in turn, rebooting between
+// them (the one licensed ESP.restart() in the project — see the CLAUDE.md
+// gotcha for why the strapping-pin rule doesn't apply on the only board
+// that can reach this). State lives in NVS so each boot picks up where
+// the last left off; any press aborts the whole test; a run of
+// consecutive timeouts is treated as "the display isn't responding" and
+// aborts likewise. Each step's CSV is tagged with the test id and step.
+void appStartFullTest();
+
+// Full-test progress for the screen: step is 1-based, total 0 = no full
+// test in progress (clears the indicator). A board with no screen
+// ignores it.
+void boardShowFullTest(uint8_t step, uint8_t total);
+
 // Implemented in main.cpp; called by the menu's "Validate" item. Same
 // machinery as appStartAutoTest() but VALIDATE_ITERATIONS presses with a
 // much longer settling gap — the pacing half of the validation mode whose
@@ -263,6 +278,14 @@ struct RunRecord {
   uint16_t count;              // samples actually collected
   bool aborted;                // stopped early by a press
   const RunSample *samples;    // count entries, oldest first
+  // Full-test membership. fullTotal == 0 means an ordinary standalone
+  // run; nonzero means this run is step fullStep of fullTotal in full
+  // test number fullTestId, and the CSV says so — captured at run START,
+  // so a file written after the full test was aborted still carries the
+  // tag of the test it belonged to.
+  uint32_t fullTestId = 0;
+  uint8_t fullStep = 0;
+  uint8_t fullTotal = 0;
 };
 
 // Store a finished (or aborted) run. Called from loop() on core 1 once

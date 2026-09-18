@@ -99,6 +99,7 @@ a menu (AtomS3R only) is open:
 | menu | tap | advance — move the selection, or the mode picker's candidate | yes |
 | menu | hold 1s | trigger the highlighted item | yes |
 | auto test running | press | stop the run (and nothing else) | yes |
+| full test running | press | abort the whole test (all remaining steps) | yes |
 | threshold cal running | press | abort it (and nothing else) | yes |
 | storage boot | hold 1s | toggle whether the *next* reset is a drive | AtomS3R only |
 
@@ -1125,11 +1126,11 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   drive` left for the mode picker (see the storage-is-a-mode gotcha) and
   seven became the maximum again, so the pitch went **back to 12px** —
   rows from y=8, seventh at y=80, eight clear pixels above the hint at
-  y=96, and four-pixel gaps between rows instead of three.
-  **Seven is therefore the ceiling now**: an eighth row at 12px lands at
-  y=92 and runs into the hint. Eight fits only by going back to 11px, and
-  a ninth needs a scrolling menu at any pitch — the hints and the panel
-  edge are the two things that cannot move.
+  y=96, and four-pixel gaps between rows instead of three. Then `Full
+  test` made a BLE-mode list eight rows again, and the pitch went back
+  to **11px** for the third time. **Eight at 11px is the standing
+  state**: a ninth needs a scrolling menu at any pitch — the hints and
+  the panel edge are the two things that cannot move.
 - **The top menu is ordered by reach, not by the order the items were
   written.** `Auto test` and `Change mode` are what the menu is opened
   for most often, so they are rows one and two, where a tap-driven list
@@ -1145,3 +1146,42 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   lesson: the items stopped being a fixed array indexed by row when
   `Pairing` made the list's length depend on the mode, precisely so a
   list that changes cannot silently make `case 3:` mean something new.
+- **"Full test" chains an auto test through all six modes via reboots —
+  and contains the project's ONE licensed `ESP.restart()`.** The
+  never-reboot-from-code rule exists because on the S3-Zero the button IS
+  GPIO0, the boot-strapping pin, held low at exactly the wrong moment by
+  the old hold-to-cycle gesture. Full test is unreachable on that board
+  (menu + sensor are AtomS3R-only), and on the AtomS3R GPIO0 is the
+  LP5562's I2C clock — idle HIGH, with no transaction in flight at
+  restart time (backlight is set once at boot). The restart additionally
+  refuses to fire while the button is down (`stableState` guard) and
+  only ever runs from `FULL_REBOOTING`, between steps, unattended. Do
+  not cite this exception to justify a second one without re-deriving
+  the argument.
+- **Full test mechanics** (`serviceFullTest()` in main.cpp): NVS keys in
+  `usbmode` — `fullstep` (0-based step owed; absent = no test),
+  `fullstart` (mode the test began in; steps run `(start + step) % 6`),
+  `fullid` (names the test in its CSVs). Step 0 runs in the current boot;
+  each completion writes the next mode into the mode key, bumps
+  `fullstep`, pauses `FULL_REBOOT_PAUSE_MS`, reboots; the next boot
+  resumes into `FULL_SETTLE` (after `bleBegin()`, so a BLE step's
+  link-wait clock starts with the radio actually advertising):
+  `FULL_SETTLE_MS` fixed enumeration wait, plus for BLE steps a
+  subscribed host within `FULL_LINK_TIMEOUT_MS` or the test aborts —
+  hanging forever on a host that never reconnects is worse than a
+  partial set of files. Aborts: ANY press (including between steps),
+  `FULL_MAX_CONSEC_TIMEOUTS` consecutive timeouts in a step ("the
+  display stopped responding" — counted in `collectSample()`, the one
+  place every recorded sample passes on core 1), a refused run start
+  (`fullRunStarted` distinguishes refused from finished), or a corrupt
+  step value at boot. Abort clears NVS so no future boot resumes.
+  Starting a full test disarms the USB-drive flag — an armed drive would
+  hijack the first reboot. A storage boot deliberately KEEPS a valid
+  fullstep (the user detoured for files; the test resumes on the next
+  HID boot). Each step's CSV carries `# fulltest,<id>` and
+  `# fullstep,<k>/<6>` — membership is captured at run START, so a file
+  written after an abort still says which test it belonged to; the
+  analyzer ignores unknown `#` lines by construction. The menu item sits
+  BELOW Exit on purpose: a ~15-minute six-reboot run is the last thing a
+  stray extra tap should land on, and it put the menu back at eight rows
+  / 11px pitch (see the ceiling gotcha).

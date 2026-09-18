@@ -427,6 +427,11 @@ static volatile HoldRung wantHint = RUNG_STATS;
 static volatile uint16_t autoDone = 0;
 static volatile uint16_t autoTotal = 0;
 
+// Full-test progress, same push-from-core-1 pattern. fullTotal == 0 means
+// no full test in progress.
+static volatile uint8_t fullStepShown = 0;
+static volatile uint8_t fullTotalShown = 0;
+
 // The menu's own state — see the file header for what each level looks
 // like. menuState is volatile because boardMenuActive() (below) is
 // called from main.cpp on core 1; topIndex never is, so it doesn't need
@@ -459,10 +464,12 @@ enum TopItem : uint8_t {
   ITEM_MODE,
   ITEM_PAIR,   // BLE modes only
   ITEM_EXIT,
+  ITEM_FULL,   // deliberately BELOW Exit: a ~15-minute six-reboot run is
+               // the last thing a stray extra tap should land on
   ITEM_KINDS,
 };
 static const char *TOP_ITEM_LABELS[ITEM_KINDS] = {
-  "Light meter", "Auto test", "Validate", "Sensor", "Change mode", "Pairing", "Exit"
+  "Light meter", "Auto test", "Validate", "Sensor", "Change mode", "Pairing", "Exit", "Full test"
 };
 // Built once per boot by buildTopMenu(), from the mode. Fixed for the
 // life of the boot, exactly like the mode it is derived from, so nothing
@@ -817,21 +824,33 @@ static void drawNextLine(Mode active, Mode pending, HoldRung hint) {
   char buf[32];
   uint16_t color;
 
-  if (autoTotal > 0) {
+  if (fullTotalShown > 0 && autoTotal == 0) {
+    // A full test between runs: settling after a reboot, or waiting on a
+    // BLE host. The step counter is the useful part; "settling" says why
+    // nothing appears to be happening.
+    snprintf(buf, sizeof(buf), "FULL %u/%u settling...",
+             (unsigned)fullStepShown, (unsigned)fullTotalShown);
+    color = riseColor();
+  } else if (autoTotal > 0) {
     // An automated run outranks the other two: it's the only one of the
     // three that changes second to second, and while it runs the button
     // means "stop" rather than any of the hold rungs.
     //
     // Width: Font0 is a 6px cell, so 21 characters is the whole 128px
-    // panel. At AUTO_TEST_ITERATIONS = 500 the widest this ever renders
-    // is "AUTO 499/500 tap=stop" — exactly 21, exactly full width, no
+    // panel. The widest of the three run forms is the full-test one,
+    // "F3/6 499/500 tap=stop" — exactly 21, exactly full width, no
     // margin left. (Displayed done never reaches total: the run swaps
-    // back to the normal display on its last release.) Raising the
-    // iteration count to four digits would push this over and clip the
-    // tail, so shorten the hint if that ever happens.
-    snprintf(buf, sizeof(buf), "%s %u/%u tap=stop",
-             validationActive ? "VAL" : "AUTO",
-             (unsigned)autoDone, (unsigned)autoTotal);
+    // back to the normal display on its last release.) Four-digit
+    // iteration counts would clip the tail; shorten the hint then.
+    if (fullTotalShown > 0) {
+      snprintf(buf, sizeof(buf), "F%u/%u %u/%u tap=stop",
+               (unsigned)fullStepShown, (unsigned)fullTotalShown,
+               (unsigned)autoDone, (unsigned)autoTotal);
+    } else {
+      snprintf(buf, sizeof(buf), "%s %u/%u tap=stop",
+               validationActive ? "VAL" : "AUTO",
+               (unsigned)autoDone, (unsigned)autoTotal);
+    }
     color = riseColor();
   } else if (appStorageArmed()) {
     // Outranks a queued mode change because it is what the next reset
@@ -949,11 +968,12 @@ static void drawMenuTop() {
   // had cost: the pitch is 12px again, rows from y=8, so the seventh
   // lands at y=80 and clears the hints at 96/108 by eight pixels, with
   // Font0's 8px cell leaving four clear pixels per gap instead of
-  // three. Seven IS the ceiling at this pitch — an eighth row would sit
-  // at y=92 and run into the hint at y=96. Eight fits only at the 11px
-  // pitch this just came off; a ninth needs a scrolling menu at any
-  // pitch.
-  const int rowH = 12;
+  // three. Back to the 11px pitch (third visit — see the ceiling gotcha's
+  // pitch history): Full test is the eighth row in a BLE mode, and eight
+  // rows fit only at 11px, ending at y=85 with the hints at 96/108.
+  // Seven fits at the comfier 12px; a NINTH needs a scrolling menu at
+  // any pitch, and that remains the hard ceiling.
+  const int rowH = 11;
   const int top = 8;
   char buf[24];
   for (int i = 0; i < numTopItems; i++) {
@@ -1733,6 +1753,7 @@ static void uiTaskFn(void *) {
   // non-BLE mode sits in it forever).
   LinkState shownLink = (LinkState)0xFF;
   uint8_t shownSensor = 0xFF;  // != any real config, forces the first draw
+  uint8_t shownFullStep = 0xFF, shownFullTotal = 0xFF;  // full-test progress line
   uint16_t shownAutoDone = 0xFFFF;      // != any real count, same trick again
   uint16_t shownAutoTotal = 0xFFFF;
   int shownRaw = -1;
@@ -1866,6 +1887,12 @@ static void uiTaskFn(void *) {
             menuState = MENU_NONE;
             break;
           case ITEM_SENSOR: menuState = MENU_SENSOR; break;
+          case ITEM_FULL:
+            // Six auto tests, five reboots, unattended — main.cpp owns
+            // all of it from here; any press stops the whole thing.
+            appStartFullTest();
+            menuState = MENU_NONE;
+            break;
           case ITEM_MODE:  menuState = MENU_MODE; break;
           // Pairing has no picker of its own and nothing to confirm: it
           // is a single irreversible-ish act (bonds gone, advertising
@@ -1926,7 +1953,8 @@ static void uiTaskFn(void *) {
                      meterView != shownMeter ||
                      menuState != shownMenuState || topIndex != shownTopIndex ||
                      armed != shownArmed || ejected != shownEjected ||
-                     link != shownLink || activeSensor != shownSensor);
+                     link != shownLink || activeSensor != shownSensor ||
+                     fullStepShown != shownFullStep || fullTotalShown != shownFullTotal);
     // A clear only shows up in the measure view's top strip; the meter
     // view is live anyway and will repaint on its own cadence. The
     // histogram is visible in both views, so it always needs redrawing.
@@ -1986,6 +2014,8 @@ static void uiTaskFn(void *) {
         shownActive = active;
         shownLink = link;
         shownSensor = activeSensor;
+        shownFullStep = fullStepShown;
+        shownFullTotal = fullTotalShown;
         shownPending = pending;
         shownMeter = meterView;
         shownHint = hint;
@@ -2082,6 +2112,12 @@ bool boardMeasurementBusy() {
   return measureBusy;
 }
 
+void boardShowFullTest(uint8_t step, uint8_t total) {
+  fullStepShown = step;
+  fullTotalShown = total;
+  nudgeUi();
+}
+
 void boardShowAutoTest(uint16_t done, uint16_t total) {
   autoDone = done;
   autoTotal = total;
@@ -2155,6 +2191,13 @@ void boardWriteRun(const RunRecord &run) {
   runEmit(f, "# planned,%u\n", (unsigned)run.planned);
   runEmit(f, "# recorded,%u\n", (unsigned)run.count);
   runEmit(f, "# aborted,%s\n", run.aborted ? "yes" : "no");
+  if (run.fullTotal > 0) {
+    // Full-test membership, so the six files of one test can be grouped
+    // after the fact. Unknown "# key,value" lines are ignored by the
+    // analyzer's parser by construction, so old tooling stays happy.
+    runEmit(f, "# fulltest,%u\n", (unsigned)run.fullTestId);
+    runEmit(f, "# fullstep,%u/%u\n", (unsigned)run.fullStep, (unsigned)run.fullTotal);
+  }
   runEmit(f, "seq,gap_ms,dir,latency_us,status\n");
 
   for (uint16_t i = 0; i < run.count; i++) {
@@ -2327,6 +2370,8 @@ static void buildTopMenu(Mode active) {
   topItems[numTopItems++] = ITEM_VALIDATE;
   topItems[numTopItems++] = ITEM_SENSOR;
   topItems[numTopItems++] = ITEM_EXIT;
+  // Below Exit on purpose — the bottom of the list, per the enum comment.
+  topItems[numTopItems++] = ITEM_FULL;
 }
 
 void boardShowBoot(Mode active, Mode pending) {
