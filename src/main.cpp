@@ -580,12 +580,16 @@ static void bleUpdateLink() {
 
 class BleCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer *server, NimBLEConnInfo &info) override {
+    (void)server;
     bleConnHandle = info.getConnHandle();
-    // Ask for the interval we actually want as soon as there is a link to
-    // ask on. The host is free to say no; see BLE_CONN_ITVL_MIN above.
-    server->updateConnParams(info.getConnHandle(), BLE_CONN_ITVL_MIN,
-                             BLE_CONN_ITVL_MAX, BLE_CONN_LATENCY,
-                             BLE_CONN_TIMEOUT);
+    // Deliberately NOT the place the connection-parameter request goes,
+    // any more: a param-update request landing in the middle of the SMP
+    // pairing exchange is a documented way to make some hosts abandon
+    // the pairing (it was flagged as an untested risk when this code
+    // first landed, and "can't pair a new host" is its symptom). It
+    // moved to onSubscribe() — by subscription time pairing is long
+    // finished, and nothing is measured before subscription anyway, so
+    // the interval is still in force before the first sample.
     bleUpdateLink();
   }
 
@@ -597,17 +601,41 @@ class BleCallbacks : public NimBLEServerCallbacks {
     // NimBLE re-advertises on disconnect by itself (advertiseOnDisconnect
     // defaults to true), which is exactly the behaviour wanted: a tester
     // that had to be power-cycled to be found again would be a nuisance
-    // on the board with no screen especially. Nothing to do but say so.
+    // on the board with no screen especially.
     (void)server;
+    // The pairing gesture calls deleteAllBonds() while its disconnect is
+    // still in flight (disconnect() is asynchronous), and the stack may
+    // persist per-peer state as the link finally tears down — quietly
+    // re-creating a bond entry AFTER the wipe. If the pairing gesture is
+    // still armed when a link dies, sweep again from the teardown side,
+    // where nothing can be mid-flight any more. NVS write in a host-task
+    // callback: same licence as the gesture itself — pairing mode is a
+    // deliberate action taken while nothing is measured.
+    if (blePairingArmed && NimBLEDevice::getNumBonds() > 0) {
+      NimBLEDevice::deleteAllBonds();
+    }
     bleUpdateLink();
   }
 
   void onAuthenticationComplete(NimBLEConnInfo &info) override {
-    // Nothing to gate on here — subscription is what the send path waits
-    // for, and it comes after this. Kept for the link state only: a
-    // failed pairing leaves the link unusable and the screen should not
-    // go on claiming otherwise.
-    if (!info.isEncrypted()) bleReady = false;
+    if (!info.isEncrypted()) {
+      // A link that failed to encrypt must be TORN DOWN, not merely
+      // marked unusable. The realistic way to get here: the pairing
+      // gesture deleted this device's bonds while some previously bonded
+      // host still holds its half — that host reconnects, encryption
+      // fails against the missing key, and without this disconnect the
+      // dead link just... stays. The peripheral stops advertising while
+      // connected, so a camped dead link makes the device undiscoverable
+      // to the NEW host the pairing gesture was performed for — from the
+      // outside, "pairing is broken". Disconnecting resumes advertising
+      // (advertiseOnDisconnect) and lets the new host in; the stale host
+      // will retry and get dropped again until someone tells it to
+      // forget the device, which is the best a peripheral can do.
+      bleReady = false;
+      if (bleServer && info.getConnHandle() != BLE_HS_CONN_HANDLE_NONE) {
+        bleServer->disconnect(info.getConnHandle());
+      }
+    }
     bleUpdateLink();
   }
 };
@@ -625,6 +653,14 @@ class BleInputCallbacks : public NimBLECharacteristicCallbacks {
       // The pairing gesture has done its job the moment a host is
       // actually listening.
       blePairingArmed = false;
+      // The latency-motivated interval request, moved here from
+      // onConnect() so it can never land mid-pairing — see the comment
+      // there. The host is free to say no; see BLE_CONN_ITVL_MIN above.
+      if (bleServer) {
+        bleServer->updateConnParams(info.getConnHandle(), BLE_CONN_ITVL_MIN,
+                                    BLE_CONN_ITVL_MAX, BLE_CONN_LATENCY,
+                                    BLE_CONN_TIMEOUT);
+      }
     }
     bleUpdateLink();
   }

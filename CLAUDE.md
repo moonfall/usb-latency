@@ -1196,3 +1196,25 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   BELOW Exit on purpose: a ~15-minute six-reboot run is the last thing a
   stray extra tap should land on, and it put the menu back at eight rows
   / 11px pitch (see the ceiling gotcha).
+- **Three pairing bugs, found together when "pair a new host" failed on
+  hardware.** (1) A link that failed encryption was left CONNECTED: the
+  pairing gesture deletes this device's bonds, a previously bonded host
+  reconnects, encryption fails against the missing key — and the dead
+  link just stayed up. A peripheral stops advertising while connected,
+  so the camped dead link made the device undiscoverable to the new
+  host; from outside, "pairing is broken". `onAuthenticationComplete`
+  now disconnects any link that comes out unencrypted, which resumes
+  advertising; the stale host gets dropped on every retry until it
+  forgets the device (a peripheral can do no more — silence or forget
+  the OLD host when pairing a new one, it will otherwise keep grabbing
+  the radio). (2) The connection-parameter request fired in
+  `onConnect()`, i.e. inside the SMP pairing window — a documented way
+  to make some hosts abandon pairing, and flagged as an untested risk
+  when the BLE code first landed. It moved to `onSubscribe()`: pairing
+  is long over by then, and nothing is measured before subscription, so
+  the latency-motivated interval is still in force before the first
+  sample. (3) The pairing gesture's `deleteAllBonds()` races its own
+  asynchronous `disconnect()` — the stack can persist per-peer state as
+  the link finally tears down, re-creating a bond entry after the wipe.
+  `onDisconnect` now sweeps again if the pairing gesture is still armed
+  when a link dies.
