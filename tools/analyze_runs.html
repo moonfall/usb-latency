@@ -12,6 +12,7 @@
     --dim: #8b93a0;
     --rise: #78dce6;    /* cyan  — matches the device's rise colour  */
     --fall: #ff82dc;    /* magenta — matches the device's fall colour */
+    --mono: #ffd24a;    /* yellow — everything pooled, when the rise/fall split is off */
     --warn: #ff8c3c;
     --accent: #ffbe28;
   }
@@ -107,6 +108,8 @@
   }
   #controls.show { display: flex; }
   #controls input[type=range] { flex: 0 1 320px; accent-color: var(--accent); }
+  #controls .chk { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text); }
+  #controls .chk input { accent-color: var(--accent); margin: 0; }
   #binsVal { color: var(--text); font-variant-numeric: tabular-nums; min-width: 3ch; }
 
   .filecard label { display: flex; align-items: center; gap: 10px; cursor: pointer; }
@@ -131,6 +134,7 @@
   <label for="bins">Bins</label>
   <input type="range" id="bins" min="20" max="600" step="5" value="80">
   <span id="binsVal">80</span>
+  <label class="chk"><input type="checkbox" id="split" checked> Split rise/fall</label>
 </div>
 <div id="out"><div id="empty">No data loaded yet.</div></div>
 
@@ -373,6 +377,11 @@
 
     const cssRise = getComputedStyle(document.documentElement).getPropertyValue("--rise").trim();
     const cssFall = getComputedStyle(document.documentElement).getPropertyValue("--fall").trim();
+    const cssMono = getComputedStyle(document.documentElement).getPropertyValue("--mono").trim();
+    // Unchecked = don't separate directions at all: no Rising/Falling
+    // sections, and every histogram is one yellow series instead of the
+    // cyan/magenta stack.
+    const split = document.getElementById("split").checked;
 
     // A section = stats grid + one stacked rise/fall histogram over an
     // arbitrary slice of the pool. All/Rising/Falling and every breakout
@@ -391,8 +400,12 @@
         `<div class="stats">${statCells(stats)}</div>` +
         `<canvas></canvas><div class="hist-note"></div></div>`);
       const series = [];
-      if (fall.length) series.push({ values: fall, color: cssFall });
-      if (rise.length) series.push({ values: rise, color: cssRise });
+      if (split) {
+        if (fall.length) series.push({ values: fall, color: cssFall });
+        if (rise.length) series.push({ values: rise, color: cssRise });
+      } else if (ok.length) {
+        series.push({ values: ok.map(x => x.latencyUs), color: cssMono });
+      }
       pendingDraws.push({ id, series });
     }
 
@@ -403,10 +416,12 @@
 
     addSection("sec-all", "", "All readings",
       `${activeFiles.length} dataset(s)${modeNote}`, all);
-    addSection("sec-rise", "rise", "Rising",
-      "sensor crossed the threshold upward", all.filter(x => x.rise));
-    addSection("sec-fall", "fall", "Falling",
-      "sensor crossed the threshold downward", all.filter(x => !x.rise));
+    if (split) {
+      addSection("sec-rise", "rise", "Rising",
+        "sensor crossed the threshold upward", all.filter(x => x.rise));
+      addSection("sec-fall", "fall", "Falling",
+        "sensor crossed the threshold downward", all.filter(x => !x.rise));
+    }
 
     // Breakouts: by transport and by device kind, derived from each
     // file's mode string ("GAMEPAD", "BLE KEYBOARD", ...). A breakout
@@ -418,6 +433,14 @@
       ["bo-gamepad", "Gamepad", "USB + BLE gamepad pooled", m => m.includes("GAMEPAD")],
       ["bo-keyboard", "Keyboard", "USB + BLE keyboard pooled", m => m.includes("KEYBOARD")],
       ["bo-mouse", "Mouse", "USB + BLE mouse pooled", m => m.includes("MOUSE")],
+      // Then each individual mode, in device order — exact mode-string
+      // matches, so "GAMEPAD" can't swallow "BLE GAMEPAD".
+      ["bo-usb-gamepad", "USB Gamepad", "this one mode only", m => m === "GAMEPAD"],
+      ["bo-usb-keyboard", "USB Keyboard", "this one mode only", m => m === "KEYBOARD"],
+      ["bo-usb-mouse", "USB Mouse", "this one mode only", m => m === "MOUSE"],
+      ["bo-ble-gamepad", "BLE Gamepad", "this one mode only", m => m === "BLE GAMEPAD"],
+      ["bo-ble-keyboard", "BLE Keyboard", "this one mode only", m => m === "BLE KEYBOARD"],
+      ["bo-ble-mouse", "BLE Mouse", "this one mode only", m => m === "BLE MOUSE"],
     ];
     let breakoutHeaderAdded = false;
     for (const [id, title, subtitle, test] of breakouts) {
@@ -500,6 +523,7 @@
     binsVal.textContent = binsSlider.value;
     render();
   });
+  document.getElementById("split").addEventListener("change", render);
 })();
 </script>
 </body>
