@@ -1070,6 +1070,72 @@ void appStartValidation() {
   autoStartRequested = true;
 }
 
+// --- The threshold calibration's one input event ----------------------
+// The calibration (board_atoms3r.cpp's runThresholdCal()) characterises
+// the display in two states, and something has to change the display
+// between them. That used to be the user, by hand, answering a prompt;
+// it is one firmware-made press now — which puts it here, because this
+// is the only file allowed to touch USB or the radio and the calibration
+// itself runs on the board's UI task on the other core.
+//
+// Deliberately NOT through boardShowPress(): that entry point is how a
+// press starts a *measurement* — it hands over t0 and raises the board's
+// measurePending/measureBusy pair — and a measurement fired inside a
+// calibration would have the UI task timing an ADC it is in the middle
+// of sampling for the capture, for a press nobody asked to time. This
+// press exists to move the display and nothing else, so it is the raw
+// send pair and no more.
+static volatile bool calPressRequested = false;
+// Raised by appCalPress() itself rather than by the servicing below: the
+// board polls this the instant after it requests, and loop() can start
+// and finish the whole press in between, so a flag first raised on this
+// side could be cleared before the waiter ever saw it go up.
+static volatile bool calPressBusy = false;
+static bool calPressDown = false;    // core 1 only: a release is still owed
+static uint32_t calPressedAtMs = 0;
+
+void appCalPress() {
+  calPressBusy = true;      // before the request, not after — see above
+  calPressRequested = true;
+}
+
+bool appCalPressBusy() { return calPressBusy; }
+
+// Would a press actually reach a host right now? A USB mode always has
+// somewhere to send; a BLE mode needs a subscribed host, which is what
+// bleReady means everywhere else in this file. The board asks before
+// starting a calibration: one whose middle press went nowhere would
+// characterise the same display state twice and report an overlap that
+// says nothing about the sensor or the placement.
+bool appCanSendInput() {
+  return modeIsBle(activeMode) ? bleReady : true;
+}
+
+// Paced across loop() passes rather than held through a delay(), for the
+// same reason the automated test's press is: core 1's job is to go on
+// noticing button edges. AUTO_HOLD_MS is reused rather than duplicated —
+// it is the same "plausible press length" question, and the answer being
+// one number is the point.
+//
+// The send results are ignored, uniquely here: the only way one can fail
+// is a BLE host that left after appCanSendInput() said yes, and the
+// consequence — capture 2 measuring the same state as capture 1 — is
+// already reported honestly as an overlap.
+static void serviceCalPress(uint32_t now) {
+  if (calPressRequested) {
+    calPressRequested = false;
+    sendPress();
+    calPressedAtMs = now;
+    calPressDown = true;
+    return;
+  }
+  if (calPressDown && (now - calPressedAtMs) >= AUTO_HOLD_MS) {
+    sendRelease();
+    calPressDown = false;
+    calPressBusy = false;  // last: this is the flag the blocked UI task waits on
+  }
+}
+
 // The one place a run's file is written. Deliberately not called from
 // wherever a run happens to end: an abort is handled on core 1 at the
 // press edge, which can be partway through core 0's measurement of the
@@ -1378,6 +1444,9 @@ void loop() {
   // Runs whether or not the button is down — a run proceeds with nobody
   // touching the device, so this has to come before the released-early-out.
   serviceAutoTest(now);
+  // Likewise: the calibration's press is made while the user is holding
+  // nothing, and the board's UI task is blocked waiting for it.
+  serviceCalPress(now);
 
   if (!stableState) return;
 

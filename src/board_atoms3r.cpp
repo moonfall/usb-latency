@@ -299,6 +299,17 @@ static void activateSensor(uint8_t idx, bool persist) {
 // it nothing.
 static const uint32_t CAL_START_DELAY_MS = 1000;
 
+// How long to wait after the calibration's own press has gone out before
+// capture 2 starts sampling. The press is the thing that changes the
+// display, and the change is not instant: the host has to notice the HID
+// report, the page has to repaint, the panel has to finish its own
+// transition, and the sensor has its own response time on top. Sampling
+// through any of that would put the transition itself into the set that
+// is supposed to characterise the steady state — which is precisely the
+// overlap the report warns about. Half a second is generous against
+// every one of those and costs a capture nothing.
+static const uint32_t CAL_SETTLE_MS = 500;
+
 // How long to wait for the display to respond before giving up. Also the
 // longest this task can hold core 0 without letting its idle task run —
 // keep it well under the 5s task watchdog.
@@ -1066,19 +1077,34 @@ static void drawMenuDrive(Mode pending) {
 
 // --- Threshold calibration (meter view's replacement for Auto test) ----
 // Two labelled captures, SENSOR_CAPTURE_MS of ~1kHz raw ADC sampling
-// each: the user sets the display to one state before selecting the menu
-// item, the first capture runs, a prompt asks them to set the other
-// state and tap once, and the second capture runs. Labelling the two
-// sets beats clustering one mixed capture (the previous, Otsu-based
-// design): there is no mixture to unpick, and the threshold can be
-// placed dead-centre in the actually-measured gap between the sets, with
-// the margin reported as a number instead of inferred.
+// each, with the display changed between them by the firmware's own
+// press: the user aims the sensor and selects the item, capture 1 runs,
+// one real HID/BLE press goes out and flips the test page to its other
+// state, and capture 2 runs. Labelling the two sets beats clustering one
+// mixed capture (the previous, Otsu-based design): there is no mixture
+// to unpick, and the threshold can be placed dead-centre in the
+// actually-measured gap between the sets, with the margin reported as a
+// number instead of inferred.
 //
-// The whole flow owns the button — menuState is MENU_CAPTURE throughout,
-// so no press during it is ever a HID send. That is deliberate and new
-// relative to the old design: the user arranges the display state
-// themselves between phases, and a press that also sent a click would
-// flip the very state they just set up.
+// The whole flow still owns the button — menuState is MENU_CAPTURE
+// throughout, so no press *of the user's* is ever a HID send. What that
+// rule protects has changed shape, though, and the new split is worth
+// stating plainly:
+//
+//   * the firmware's press is the one input event the flow wants. It is
+//     made by main.cpp on core 1 (appCalPress(), which this file waits
+//     on through appCalPressBusy()), because only that file may touch
+//     USB or the radio, and it is deliberately not a measurement.
+//   * the user's button is the abort. It was the "I've set the other
+//     state, go" tap in the manual design; with no manual step left,
+//     there is nothing for it to mean but stop — and a press that also
+//     clicked would flip the display halfway through a capture, which is
+//     the same hazard the old design was avoiding, from the other end.
+//
+// Refused outright in a BLE mode with no subscribed host (appCanSendInput()):
+// the press is the entire mechanism here, so without one the two
+// captures would characterise the same state and the report would blame
+// the sensor for an overlap the radio caused.
 //
 // Sampling yields every iteration (vTaskDelay(1)), unlike the
 // measurement's tight poll — a 10s unyielding spin would trip the core-0
@@ -1090,7 +1116,12 @@ struct CapSet {
   float mu = 0, sd = 0;
 };
 struct CalResult {
-  bool done = false;      // a calibration has run this boot
+  bool done = false;      // a calibration ran to completion, and thr is usable
+  // The two ways it can end with nothing to apply. Both leave done
+  // false, which is what stops the report's hold from writing a stale
+  // threshold from some earlier run.
+  bool cancelled = false; // a user press ended it early
+  bool noLink = false;    // refused to start: nothing would have received the press
   bool clean = false;     // the two sets don't overlap
   CapSet dim, bright;     // ordered by mean, not by capture order
   int thr = 0;            // suggested threshold
@@ -1119,6 +1150,9 @@ static void drawCaptureProgress(int phase, uint32_t elapsedMs, uint16_t curMin, 
   snprintf(buf, sizeof(buf), "seen %u - %u", curMin, curMax);
   display.drawString(buf, SCREEN_W / 2, 52);
   display.drawString("hold the display steady", SCREEN_W / 2, 76);
+  // The button's only job during the flow now — worth saying, since it
+  // used to be how the user advanced it.
+  display.drawString("tap: cancel", SCREEN_W / 2, 100);
   display.endWrite();
 }
 
@@ -1141,28 +1175,48 @@ static void drawCaptureReady() {
   display.endWrite();
 }
 
-static void drawCapturePrompt(const CapSet &first) {
+// Between the two captures, in place of the old "switch the display and
+// tap" prompt: the press is going out and the display is being given
+// CAL_SETTLE_MS to actually change. A frame of its own for the same
+// reason GET READY is one — nothing is being sampled yet, and the
+// progress screen would be claiming otherwise. Capture 1's numbers used
+// to be shown here; they are not, because there is no longer any
+// decision for the user to make against them, and the report a few
+// seconds later carries both sets properly.
+static void drawCaptureSwitching(const CapSet &first) {
   display.startWrite();
   display.fillScreen(black());
   display.setFont(&fonts::Font2);
   display.setTextDatum(textdatum_t::top_center);
   display.setTextColor(display.color565(255, 190, 40), black());
-  display.drawString("CAPTURE 1 DONE", SCREEN_W / 2, 16);
+  display.drawString("SWITCHING", SCREEN_W / 2, 16);
   display.setFont(&fonts::Font0);
   display.setTextColor(dimColor(), black());
   char buf[28];
-  snprintf(buf, sizeof(buf), "mean %.0f  range %u-%u", first.mu, first.minV, first.maxV);
+  snprintf(buf, sizeof(buf), "capture 1 mean %.0f", first.mu);
   display.drawString(buf, SCREEN_W / 2, 44);
-  display.drawString("switch the display to", SCREEN_W / 2, 66);
-  display.drawString("the OTHER state, then", SCREEN_W / 2, 78);
+  display.drawString("sending one press to", SCREEN_W / 2, 66);
+  display.drawString("flip the display", SCREEN_W / 2, 78);
   display.setTextColor(riseColor(), black());
-  display.drawString("tap: start capture 2", SCREEN_W / 2, 100);
+  display.drawString("capture 2 next", SCREEN_W / 2, 100);
   display.endWrite();
+}
+
+// Any user press during the flow means stop. There is no step left that
+// wants one — the firmware makes its own input event now — so the only
+// thing the button can usefully mean here is "abandon this", and both
+// gestures count: a tap and a hold are equally that. Checked everywhere
+// the flow waits or samples, so an abort never has to wait out a
+// ten-second capture to take effect.
+static bool calAbortRequested() {
+  return menuTapRequested || menuSelectRequested;
 }
 
 // One phase: fill `hist`, summarise into `out`. Streaming min/max feed
 // the progress screen; mean/sd come off the histogram afterwards.
-static void capturePhase(int phase, uint16_t *hist, CapSet &out) {
+// Returns false if the user asked to stop partway, in which case `out`
+// is meaningless and the caller abandons the whole calibration.
+static bool capturePhase(int phase, uint16_t *hist, CapSet &out) {
   memset(hist, 0, 4096 * sizeof(uint16_t));
   uint16_t mn = 4095, mx = 0;
   uint32_t n = 0;
@@ -1170,6 +1224,7 @@ static void capturePhase(int phase, uint16_t *hist, CapSet &out) {
   drawCaptureProgress(phase, 0, 0, 0);  // immediately, not 500ms late
 
   for (;;) {
+    if (calAbortRequested()) return false;
     uint32_t elapsed = millis() - start;
     if (elapsed >= SENSOR_CAPTURE_MS) break;
     int v = analogRead(sensorPin());
@@ -1199,17 +1254,31 @@ static void capturePhase(int phase, uint16_t *hist, CapSet &out) {
     out.mu = sum / n;
     out.sd = sqrt(fmax(0.0, sq / n - out.mu * out.mu));
   }
+  return true;
 }
 
 // The whole calibration, run linearly on the UI task from the menu's
 // select handler. Blocking in here is fine — this task owns the screen
 // and the sensor, and everything it would otherwise be doing is exactly
-// what this flow is doing. The inter-phase wait polls the tap request
-// flag that loop() (core 1) sets, which is also why the flags are
-// cleared before the wait: a tap queued during phase 1 must not start
-// phase 2 on its own.
+// what this flow is doing. It is also why the mid-flow press has to be
+// asked of main.cpp and waited on rather than simply called: the send
+// belongs on core 1, and this task is parked in here for twenty-odd
+// seconds.
+//
+// Every wait in here is a vTaskDelay poll, never a spin: the flow lasts
+// far longer than the 5s task watchdog would tolerate being held. Each
+// one also checks calAbortRequested(), so the user's press gets out of
+// any stage — including the middle of a capture — rather than being
+// noticed whenever the next one ends.
 static void runThresholdCal() {
   CapSet a, b;
+
+  // Cleared up front rather than just before the results are filled in:
+  // every early return below leaves this struct as the report, and a
+  // previous run's numbers surviving an abort would be worse than no
+  // report at all — the hold would then apply a threshold belonging to
+  // some other display state entirely.
+  cal = CalResult();
 
   // Let go and aim before anything is sampled. vTaskDelay rather than a
   // busy wait for the same reason capturePhase() yields every sample:
@@ -1218,20 +1287,45 @@ static void runThresholdCal() {
   drawCaptureReady();
   vTaskDelay(pdMS_TO_TICKS(CAL_START_DELAY_MS));
 
-  capturePhase(1, capHistA, a);
-
-  drawCapturePrompt(a);
-  menuTapRequested = false;
-  menuSelectRequested = false;
-  while (!menuTapRequested && !menuSelectRequested) {
-    vTaskDelay(pdMS_TO_TICKS(20));
+  if (!capturePhase(1, capHistA, a)) {
+    cal.cancelled = true;
+    return;
   }
-  menuTapRequested = false;
-  menuSelectRequested = false;
 
-  capturePhase(2, capHistB, b);
+  // The step that used to be the user's. One real press in the active
+  // mode, made by main.cpp on the other core, which clicks whatever the
+  // test page is and flips it to its other state — the same report a
+  // finger on the button would have sent, which is the point: if this
+  // device can change the display at all, this is how.
+  drawCaptureSwitching(a);
+  appCalPress();
+  while (appCalPressBusy()) {
+    if (calAbortRequested()) {
+      // main.cpp still owes the release and will send it on its own
+      // pacing; leaving it to do that is what keeps an abort from
+      // handing the host a stuck button.
+      cal.cancelled = true;
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
 
-  cal = CalResult();
+  // Then let the display and the sensor finish arriving at the new state
+  // before measuring it. See CAL_SETTLE_MS.
+  uint32_t settleStart = millis();
+  while ((uint32_t)(millis() - settleStart) < CAL_SETTLE_MS) {
+    if (calAbortRequested()) {
+      cal.cancelled = true;
+      return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+
+  if (!capturePhase(2, capHistB, b)) {
+    cal.cancelled = true;
+    return;
+  }
+
   cal.done = true;
   const bool aDim = a.mu <= b.mu;
   cal.dim = aDim ? a : b;
@@ -1439,7 +1533,10 @@ static void drawValReport() {
 // The calibration's report. Suggested threshold big and amber, both
 // sets' level and spread, and either the margin (clean) or the overlap
 // count (not) — so "how safe is this threshold" is a number on the
-// screen, not a feeling.
+// screen, not a feeling. Or, when the flow produced no threshold at all,
+// the reason: an abort and a refusal both land here rather than dropping
+// silently back to the meter, because a flow that just vanished would
+// read as a crash.
 static void drawCaptureResult() {
   uint16_t dim = dimColor();
   uint16_t amber = display.color565(255, 190, 40);
@@ -1450,6 +1547,28 @@ static void drawCaptureResult() {
   display.setTextDatum(textdatum_t::top_center);
   display.setTextColor(dim, black());
   display.drawString("THRESHOLD CAL", SCREEN_W / 2, 4);
+
+  if (cal.noLink) {
+    display.setFont(&fonts::Font2);
+    display.setTextColor(warn, black());
+    display.drawString("NO LINK", SCREEN_W / 2, 30);
+    display.setFont(&fonts::Font0);
+    display.setTextColor(dim, black());
+    display.drawString("no host is listening,", SCREEN_W / 2, 62);
+    display.drawString("so nothing would flip", SCREEN_W / 2, 74);
+    display.drawString("tap: done", SCREEN_W / 2, 112);
+    return;
+  }
+  if (cal.cancelled) {
+    display.setFont(&fonts::Font2);
+    display.setTextColor(warn, black());
+    display.drawString("CANCELLED", SCREEN_W / 2, 30);
+    display.setFont(&fonts::Font0);
+    display.setTextColor(dim, black());
+    display.drawString("no threshold measured", SCREEN_W / 2, 66);
+    display.drawString("tap: done", SCREEN_W / 2, 112);
+    return;
+  }
 
   if (!cal.done) return;
 
@@ -1683,18 +1802,33 @@ static void uiTaskFn(void *) {
               // The meter view's version of the auto test: calibrate the
               // threshold from two labelled captures instead of timing
               // the display. menuState goes to MENU_CAPTURE *before* the
-              // flow starts and stays there throughout — every press
-              // during it is menu input, never a HID send, because the
-              // user arranges the display state by hand between phases
-              // and a press that also clicked would flip the very state
-              // they just set up. runThresholdCal() blocks right here
-              // through both captures and the tap-to-continue between
-              // them; the stale-request clearing it does internally is
-              // what keeps a phase-1 tap from starting phase 2.
+              // flow starts and stays there throughout, so every press
+              // of the user's during it is menu input and never a HID
+              // send — the flow's own input event comes from main.cpp
+              // instead (see runThresholdCal()), and the user's button
+              // is the abort.
               menuState = MENU_CAPTURE;
-              runThresholdCal();
-              menuTapRequested = false;   // a tap queued during phase 2
-              menuSelectRequested = false; // must not dismiss the report
+              if (!appCanSendInput()) {
+                // Nothing would receive the press that changes the
+                // display, so the captures would be of one state twice.
+                // Refusing and saying why beats spending twenty seconds
+                // to produce a report blaming the sensor — the same
+                // judgement main.cpp makes about starting an auto test
+                // with no link.
+                cal = CalResult();
+                cal.noLink = true;
+              } else {
+                // Blocks right here for the whole flow: two captures,
+                // the press between them and the settle after it.
+                runThresholdCal();
+              }
+              // Whatever ended the flow — finished, aborted or refused —
+              // the button state it ended on belongs to that flow, not
+              // to the report now on screen. Clearing both is what stops
+              // the very press that cancelled a calibration from also
+              // dismissing the screen explaining that it did.
+              menuTapRequested = false;
+              menuSelectRequested = false;
             } else {
               validationActive = false;  // a stale flag must not colour this run
               appStartAutoTest();

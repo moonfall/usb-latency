@@ -191,6 +191,28 @@ void appStartAutoTest();
 // checking) the board runs itself.
 void appStartValidation();
 
+// Implemented in main.cpp; the threshold calibration's one input event.
+// The calibration needs the display under test to change state between
+// its two captures, and the firmware now makes that happen itself
+// instead of asking the user to. Only main.cpp may touch USB or the
+// radio, so only main.cpp can send it.
+//
+// Asynchronous, because the send has to happen on core 1 while the board
+// is blocked in its calibration on core 0: appCalPress() only requests
+// one, and appCalPressBusy() stays true until the release has gone out.
+// It is deliberately NOT a measurement — boardShowPress() is not called
+// for it, nothing is timed, and no sample exists. See main.cpp.
+void appCalPress();
+bool appCalPressBusy();
+
+// Implemented in main.cpp; "would a press actually reach a host right
+// now?". True in every USB mode, and in a BLE mode only once a host has
+// subscribed. The board asks before starting a calibration, because the
+// press above is the entire mechanism by which the display changes: if
+// it goes nowhere, both captures measure the same state and the report
+// blames the sensor for it.
+bool appCanSendInput();
+
 // --- Recording an automated run ----------------------------------------
 // Every automated run is written out as a CSV file on the board's flash
 // filesystem, so a distribution can be looked at properly afterwards

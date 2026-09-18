@@ -99,6 +99,7 @@ a menu (AtomS3R only) is open:
 | menu | tap | advance — move the selection, or a picker's candidate | yes |
 | menu | hold 1s | trigger the highlighted item | yes |
 | auto test running | press | stop the run (and nothing else) | yes |
+| threshold cal running | press | abort it (and nothing else) | yes |
 | storage boot | hold 1s | toggle whether the *next* reset is a drive | AtomS3R only |
 
 The S3-Zero has no screen and so no menu — its button is exactly what it
@@ -281,7 +282,12 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `boardMenuSelect()`, and the two that run the other way —
   `appAdvancePendingMode()` (implemented in `main.cpp`, called by the
   board's mode-picker submenu) and `appBlePairingMode()` (likewise,
-  called by the menu's BLE-only `Pairing` item). Run recording adds `RunSample`/`RunRecord`
+  called by the menu's BLE-only `Pairing` item). The threshold
+  calibration adds three more of that second kind: `appCalPress()` /
+  `appCalPressBusy()`, the one input event that flow sends to change the
+  display under test (asynchronous, because the send belongs on core 1
+  while the board is blocked on core 0), and `appCanSendInput()`, the
+  "would a press reach a host right now" query it refuses on. Run recording adds `RunSample`/`RunRecord`
   plus one function each way: `appRecordSample()` (board → `main.cpp`,
   one measurement's latency/direction/timeout as soon as it resolves) and
   `boardWriteRun()` (`main.cpp` → board, the whole buffered run, once,
@@ -974,32 +980,64 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   calibration instead (label: "Find threshold").** Two labelled 10s
   captures (`SENSOR_CAPTURE_MS` each, ~1kHz raw ADC into a static 4096-bin
   histogram per phase — 8KB each, far too big for the UI task's stack):
-  the user sets the display to one state before selecting, capture 1
-  runs, a prompt asks for the other state and a tap, capture 2 runs. The
+  the user aims the sensor and selects, capture 1 runs, **the firmware
+  presses its own button** to flip the display to its other state, and
+  capture 2 runs. The
   suggested threshold is the dead centre of the measured gap between the
   two sets, with the margin (counts of clear air each side) reported
   next to it — or, when the sets overlap, an honest wrong-side sample
   count instead of a fake margin. This replaced a single-capture Otsu
   design within a day of it landing: labelling the sets beats clustering
   a mixture, and the margin becomes a measurement rather than an
-  inference. Design points that matter: `menuState` is `MENU_CAPTURE`
-  for the *whole* flow, so no press during it is ever a HID send — the
-  user arranges the display state by hand between phases, and a press
-  that also clicked would flip the state they just set up (the opposite
-  choice from the old design, which relied on presses flipping the
-  display mid-capture). A `GET READY` frame and a `CAL_START_DELAY_MS`
-  (1s) `vTaskDelay` sit between the selecting hold and capture 1's first
-  sample, for the same reason the automated test has one: the hand that
-  selected the item is still on the screen face the sensor is aimed at,
-  and capture 1 would otherwise open by characterising a finger. Capture
-  2 has none — it is started by a deliberate tap, with the display state
-  already arranged. `runThresholdCal()` blocks on the UI task
-  through both captures and the inter-phase wait, polling the tap
-  request flag that core 1 sets; the request flags are cleared before
-  the wait and again after the flow, so a tap queued during either
-  capture can neither start phase 2 early nor dismiss the report
-  unread. Sampling yields every iteration (`vTaskDelay(1)`) — a 10s
-  unyielding poll would trip the 5s core-0 watchdog. On the report,
+  inference. **It runs unattended** — the manual "switch the display and
+  tap" step in the middle is gone. Timeline: `GET READY` frame plus
+  `CAL_START_DELAY_MS` (1s, positioning time — the hand that selected the
+  item is still on the screen face the sensor is aimed at, and capture 1
+  would otherwise open by characterising a finger), capture 1 (10s),
+  `SWITCHING` frame plus one firmware-made press, `CAL_SETTLE_MS` (500ms,
+  for the host to notice the report, the page to repaint, the panel to
+  finish its transition and the sensor to follow), capture 2 (10s),
+  report. About 22s end to end.
+
+  The press is the part that could not stay in this file: only `main.cpp`
+  may touch USB or the radio, and `runThresholdCal()` is blocked on the
+  UI task for the whole flow. So the board asks
+  (`appCalPress()` / `appCalPressBusy()` in `board.h`) and `loop()`
+  services it on core 1 — `sendPress()`, `AUTO_HOLD_MS`, `sendRelease()`,
+  paced across passes like the automated test's press rather than held
+  through a `delay()`. Two deliberate details there: the busy flag is
+  raised by `appCalPress()` itself, because `loop()` can finish the whole
+  press before the waiter next looks; and **`boardShowPress()` is not
+  called**, so the press starts no measurement — a measurement would have
+  the UI task timing the same ADC the capture is sampling, for a press
+  nobody asked to time.
+
+  `menuState` is still `MENU_CAPTURE` for the *whole* flow, so no press
+  **of the user's** is ever a HID send. What that rule protects has
+  changed shape, and the split is now: the firmware's press is the one
+  input event the flow wants, and the user's button is the **abort**. It
+  was the "I've set the other state, go" tap in the manual design; with
+  no manual step left, stop is the only thing it can usefully mean — and
+  a user press that also clicked would flip the display halfway through a
+  capture, which is the old hazard from the other end. Both gestures
+  abort, `calAbortRequested()` is checked in every wait *and* inside both
+  capture loops (so an abort never waits out ten seconds), and the report
+  screen says `CANCELLED` rather than the flow vanishing back to the
+  meter. `cal` is reset at the *start* of the flow, not just before its
+  results are stored: an abort that left a previous run's numbers on
+  screen would let the report's hold apply a threshold belonging to some
+  other display state. Sampling yields every iteration (`vTaskDelay(1)`)
+  — a 10s unyielding poll would trip the 5s core-0 watchdog, as would
+  spinning through any of the waits.
+
+  **It refuses to start in a BLE mode with no subscribed host**
+  (`appCanSendInput()`, which is `bleReady` in a BLE mode and true
+  otherwise): the press is the entire mechanism by which the display
+  changes, so without one both captures would characterise the same state
+  and the report would blame the sensor with an `OVERLAP` for something
+  the radio did. Same judgement `serviceAutoTest()` makes about starting
+  a run with no link, and it lands on the same report screen, as
+  `NO LINK`. On the report,
   **hold applies the calibrated threshold**: `lightThreshold` is mutable,
   the value is persisted to NVS (namespace `sensor`, key `thr`) and
   re-loaded at UI-task startup — which means **a stored calibration
