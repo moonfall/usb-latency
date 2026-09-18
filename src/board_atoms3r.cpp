@@ -78,13 +78,18 @@
  * implements it):
  *
  *      MENU                    MENU_TOP: the items of this boot, cycled
- *    > Light meter              by tap and triggered by a 1s+ hold.
- *      Auto test                Light meter flips meterView and exits;
- *      Change mode              Auto test and Pairing hand off to
+ *    > Auto test                by tap and triggered by a 1s+ hold.
+ *      Change mode              Light meter flips meterView and exits;
+ *      Light meter              Auto test and Pairing hand off to
  *      Pairing                  main.cpp (which owns USB and the radio,
- *      Exit                     so it owns both) and exit; Change mode
- *   tap: next  hold: select     drops into the picker below; Exit just
- *                               leaves.
+ *      Validate                 so it owns both) and exit; Change mode
+ *      Sensor                   and Sensor drop into the pickers below;
+ *      Exit                     Exit just leaves.
+ *   tap: next  hold: select
+ *                               Ordered by reach, not by age — see
+ *                               buildTopMenu() below. Seven rows is the
+ *                               most this boot can show and the most the
+ *                               12px pitch allows; see drawMenuTop().
  *
  *                               Pairing exists only in a BLE mode — see
  *                               buildTopMenu() below, and
@@ -938,14 +943,17 @@ static void drawMenuTop() {
   display.setFont(&fonts::Font0);
   display.setTextDatum(textdatum_t::top_center);
 
-  // Seven items at most now (a BLE mode's list, Validate and Sensor
-  // included) — USB drive left for the mode picker, which is where the
-  // question it answers actually belongs. The 11px pitch from y=8 is
-  // what eight rows needed, so seven sit inside it with a row to spare:
-  // the seventh lands at y=74, Font0's 8px leaving three clear pixels
-  // per gap and the hints untouched at 96/108. Eight rows (y=85) is
-  // still the ceiling at this pitch; a ninth needs a scrolling menu.
-  const int rowH = 11;
+  // Seven items at most now (a BLE mode's list, with Pairing) — USB
+  // drive left for the mode picker, which is where the question it
+  // answers actually belongs. That bought back the pixel the eighth row
+  // had cost: the pitch is 12px again, rows from y=8, so the seventh
+  // lands at y=80 and clears the hints at 96/108 by eight pixels, with
+  // Font0's 8px cell leaving four clear pixels per gap instead of
+  // three. Seven IS the ceiling at this pitch — an eighth row would sit
+  // at y=92 and run into the hint at y=96. Eight fits only at the 11px
+  // pitch this just came off; a ninth needs a scrolling menu at any
+  // pitch.
+  const int rowH = 12;
   const int top = 8;
   char buf[24];
   for (int i = 0; i < numTopItems; i++) {
@@ -1004,11 +1012,17 @@ static void drawMenuMode(Mode active, Mode pending) {
   // colours.
   display.setTextColor(drive ? display.color565(255, 190, 40) : modeColor(pending),
                        black());
-  display.setFont(&fonts::Font4);
-  if (display.textWidth(name) > SCREEN_W - 8) {
-    display.setFont(&fonts::Font2);
-  }
-  display.drawString(name, SCREEN_W / 2, 52);
+  // Font2 for every candidate, unconditionally. This used to be Font4
+  // with a width-conditional fall back to Font2, which meant the SIZE of
+  // the text encoded nothing but the length of the name: "MOUSE" (90px
+  // in Font4) stayed big while "GAMEPAD" (122px) and every BLE name fell
+  // back, so tapping through the list made the headline jump between two
+  // sizes for no reason the user could act on. One size for all seven
+  // candidates is the fix, and Font2 is the one that fits them all —
+  // the widest, "BLE KEYBOARD", is 93px against the 120px usable width,
+  // so nothing here can ever need a fallback again.
+  display.setFont(&fonts::Font2);
+  display.drawString(name, SCREEN_W / 2, 48);
 
   display.setFont(&fonts::Font0);
   display.setTextDatum(textdatum_t::top_center);
@@ -1016,7 +1030,10 @@ static void drawMenuMode(Mode active, Mode pending) {
   // An armed drive is an "on next reset" condition in its own right —
   // pendingMode can equal activeMode and the next boot still be a drive.
   if (drive || pending != active) {
-    display.drawString("on next reset", SCREEN_W / 2, 76);
+    // Nudged up with the candidate above it: Font2 is ten pixels shorter
+    // than Font4 was, and leaving both lines where they sat left the
+    // block low in the free band between the heading and the hints.
+    display.drawString("on next reset", SCREEN_W / 2, 70);
   }
   display.drawString("tap: next", SCREEN_W / 2, 96);
   display.drawString("hold: confirm", SCREEN_W / 2, 108);
@@ -1612,11 +1629,13 @@ static void drawMenuSensor() {
 
   display.setTextDatum(textdatum_t::middle_center);
   display.setTextColor(riseColor(), black());
-  display.setFont(&fonts::Font4);
-  if (display.textWidth(SENSORS[activeSensor].name) > SCREEN_W - 8) {
-    display.setFont(&fonts::Font2);
-  }
-  display.drawString(SENSORS[activeSensor].name, SCREEN_W / 2, 46);
+  // Fixed Font2, same reasoning as the mode picker above. Both current
+  // sensor names happen to fit Font4 ("Unit Light" 107px, "BPW34" 84px),
+  // so this screen was not yet showing the two-sizes-in-one-list problem
+  // — but it was one longer name away from it, and the two pickers
+  // reading the same is worth more than the extra height.
+  display.setFont(&fonts::Font2);
+  display.drawString(SENSORS[activeSensor].name, SCREEN_W / 2, 48);
 
   display.setFont(&fonts::Font0);
   display.setTextDatum(textdatum_t::top_center);
@@ -2293,13 +2312,20 @@ bool boardButtonPressed() {
 // as over the wire, which is rather the point of having BLE modes at
 // all.
 static void buildTopMenu(Mode active) {
+  // Ordered by how often a session reaches for them, not by when they
+  // were written: Auto test and Change mode are what the menu is opened
+  // for most, so they are the two rows a tap-driven list should cost
+  // least to reach. Pairing keeps its place among the frequent items
+  // (in a BLE mode it is the thing you need when nothing works), and
+  // Validate/Sensor/Exit — setup and diagnostics, reached deliberately
+  // rather than often — sit at the bottom.
   numTopItems = 0;
-  topItems[numTopItems++] = ITEM_METER;
   topItems[numTopItems++] = ITEM_AUTO;
+  topItems[numTopItems++] = ITEM_MODE;
+  topItems[numTopItems++] = ITEM_METER;
+  if (modeIsBle(active)) topItems[numTopItems++] = ITEM_PAIR;
   topItems[numTopItems++] = ITEM_VALIDATE;
   topItems[numTopItems++] = ITEM_SENSOR;
-  topItems[numTopItems++] = ITEM_MODE;
-  if (modeIsBle(active)) topItems[numTopItems++] = ITEM_PAIR;
   topItems[numTopItems++] = ITEM_EXIT;
 }
 

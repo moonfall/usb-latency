@@ -105,8 +105,8 @@ a menu (AtomS3R only) is open:
 The S3-Zero has no screen and so no menu — its button is exactly what it
 always was: press sends the action, holding cycles the pending mode every
 3s through all six. On the AtomS3R, a 2s hold from normal operation opens
-a small menu (`Light meter`, `Auto test`, `Validate`, `Sensor`,
-`Change mode`, `Pairing` — BLE modes only — `Exit`) that owns
+a small menu (`Auto test`, `Change mode`, `Light meter`, `Pairing` —
+BLE modes only — `Validate`, `Sensor`, `Exit`) that owns
 every subsequent press until it exits: tap cycles the highlighted item, a
 1s+ hold triggers it. `Change mode` drops into a picker where tap advances
 the candidate (persisting it immediately, same NVS write the
@@ -507,6 +507,23 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `bootloader.bin` and `firmware.bin` are produced for both envs. Only
   `-t upload` has not been re-verified since — if flashing does fail, the
   `tool-esptoolpy` install is the thing to fix, not the build.
+- **A width-conditional font fallback makes text size mean "how long is
+  this word", which is not information.** Both AtomS3R pickers drew their
+  big candidate value in Font4 and fell back to Font2 only when it
+  overflowed the panel — so in the mode picker `MOUSE` (90px in Font4)
+  stayed large while `GAMEPAD` (122px) and every BLE name (141-187px)
+  shrank, and tapping through the list made the headline jump between two
+  sizes for a reason the user can neither predict nor act on. Both
+  pickers now use a fixed Font2 for the value, chosen because it is the
+  size most candidates already ended up at and it fits every one of them:
+  the widest, `BLE KEYBOARD`, is 93px against the 120px usable width, so
+  the fallback cannot be needed again. The rule is consistency *across
+  the values of one picker*, not a ban on Font4 — the calibration
+  report's threshold is still Font4 (a number of at most four digits,
+  which cannot overflow, and whose being big is the point), and so is the
+  drive screen's `READY`/`EJECTED` (two fixed strings, 83px and 111px,
+  both comfortably inside the cap — they render at the same size as each
+  other, which is the property that matters).
 - **There is no `m5stack-atoms3r` board in the platform** — `pio boards
   m5stack` lists only `m5stack-atoms3` / `m5stack-atoms3u`. The AtomS3
   profile is used instead: same ESP32-S3, same 8MB flash, same native-USB
@@ -816,17 +833,6 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   rather than one-shot on the same reasoning that made it a `Mode` — a
   drive that turned back into a gamepad on every replug is useless for
   carrying files between machines.
-- **The AtomS3R top menu is six items in a BLE mode, and the row pitch
-  has shrunk twice for them.** 16px from y=28 fitted four; 14px from y=22
-  fitted five; six (the BLE list, with `Pairing`) would have put the last
-  row at y=92, overlapping the "tap: next" hint at y=96, so it is 12px
-  from y=20 now — last row at y=80, eight clear pixels below it, and
-  Font0 being 8px tall means a 12px pitch still shows a gap between rows.
-  **That is the panel full.** A seventh item needs a scrolling menu, not
-  another row. Note the items are also no longer a fixed array indexed by
-  row: `buildTopMenu()` composes the list once per boot from the mode, and
-  the select switch dispatches on a `TopItem` identity, so a list that
-  changes length cannot silently make `case 3:` mean something new.
 - **There is no Bluedroid in this platform's prebuilt libraries, so the
   Arduino core's bundled `BLE` library cannot be used at all.** The
   library is right there in
@@ -1109,12 +1115,33 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   alongside the validation mode) — if a measurement-path hardening ever
   looks missing, check whether it lives on an unmerged branch before
   re-deriving it.
-- **The top menu peaked at eight rows, which is the hard ceiling at its
-  11px pitch; it is back to seven.** The "MENU" heading went at seven
-  items (Validate); the row pitch dropped 12px→11px at eight (Sensor),
-  putting row eight at y=85 with three clear pixels per gap and the hints
-  untouched at 96/108. `USB drive` then left the top menu for the mode
-  picker (see the storage-is-a-mode gotcha), so a BLE mode's list is
-  seven again — last row at y=74, one row of headroom. The ceiling has
-  not moved: a ninth item needs a scrolling menu, not another row, and
-  there is nothing left to shave.
+- **The top menu's ceiling is whatever its pitch allows, and it has been
+  both eight and seven.** The history, because it keeps being re-derived:
+  16px from y=28 fitted four; 14px from y=22 fitted five; 12px from y=20
+  fitted six (the BLE list, with `Pairing`); the "MENU" heading went at
+  seven items (`Validate`) to buy the rows back; and the pitch dropped
+  12px→11px at eight (`Sensor`), putting row eight at y=85 with three
+  clear pixels per gap and the hints untouched at 96/108. Then `USB
+  drive` left for the mode picker (see the storage-is-a-mode gotcha) and
+  seven became the maximum again, so the pitch went **back to 12px** —
+  rows from y=8, seventh at y=80, eight clear pixels above the hint at
+  y=96, and four-pixel gaps between rows instead of three.
+  **Seven is therefore the ceiling now**: an eighth row at 12px lands at
+  y=92 and runs into the hint. Eight fits only by going back to 11px, and
+  a ninth needs a scrolling menu at any pitch — the hints and the panel
+  edge are the two things that cannot move.
+- **The top menu is ordered by reach, not by the order the items were
+  written.** `Auto test` and `Change mode` are what the menu is opened
+  for most often, so they are rows one and two, where a tap-driven list
+  costs least to get to; `Light meter` and `Pairing` follow; `Validate`,
+  `Sensor` and `Exit` — setup and diagnostics, reached deliberately
+  rather than often — sit at the bottom. Reordering is safe to do freely,
+  and this is why: `MENU_TOP` is only ever entered through
+  `enterMenuRequested`, which sets `topIndex = 0` in the same block, and
+  no submenu returns to it (they all exit to `MENU_NONE`), so no stale
+  index can survive a list change. The select switch dispatches on a
+  `TopItem` identity rather than a row number, so the order is
+  presentation only. That last point is the older half of the same
+  lesson: the items stopped being a fixed array indexed by row when
+  `Pairing` made the list's length depend on the mode, precisely so a
+  list that changes cannot silently make `case 3:` mean something new.
