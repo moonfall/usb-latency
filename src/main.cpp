@@ -30,13 +30,13 @@
  *
  *   Inside the menu
  *     - Short press: advance — move the highlighted item, or, inside the
- *       mode picker, advance the candidate mode.
+ *       mode picker, advance the candidate identity.
  *     - Hold 1s: trigger the highlighted item's action.
  *   The menu holds the light meter (a live view, toggled instantly),
- *   the automated test (see appStartAutoTest()), arming the USB drive
- *   (see appSetStorageArmed()), changing the pending mode (see
- *   appAdvancePendingMode()) and — in a BLE mode only — pairing (see
- *   appBlePairingMode()). The first and last used to be hold-ladder
+ *   the automated test (see appStartAutoTest()), changing the pending
+ *   mode (see appSetPendingMode(), whose picker also carries arming the
+ *   USB drive — see appSetStorageArmed()) and — in a BLE mode only —
+ *   pairing (see appBlePairingMode()). The first and last used to be hold-ladder
  *   rungs of their own; moving them into a proper menu is what let
  *   short-press-to-advance and hold-to-select behave the same way at
  *   every level, instead of every feature inventing its own hold
@@ -73,7 +73,7 @@
  *   USB.begin(), and so it cannot be entered or left without a reboot —
  *   every cost the meter was moved out of Mode-hood to avoid, this one
  *   genuinely incurs. On a board that has a filesystem partition, arming
- *   it (menu -> USB drive) makes the NEXT boot come up as a small
+ *   it (menu -> Change mode -> USB DRIVE) makes the NEXT boot come up as a small
  *   mass-storage device whose blocks are the `ffat` partition itself, so
  *   the host mounts the run CSVs with no firmware in the loop. That boot
  *   has no HID device at all — a press sends nothing, which sendPress()
@@ -917,10 +917,10 @@ static inline bool sendRelease() {
   }
 }
 
-// Advances pendingMode by one and persists it — takes effect on the next
-// manual reboot, not this session.
-static void doAdvancePendingMode(bool firstOfHold) {
-  pendingMode = static_cast<Mode>((pendingMode + 1) % MODE_COUNT);
+// Sets pendingMode and persists it — takes effect on the next manual
+// reboot, not this session.
+static void setPendingMode(Mode mode, bool firstOfHold) {
+  pendingMode = mode;
   prefs.putUChar(PREFS_KEY, pendingMode);
   boardShowPending(activeMode, pendingMode, firstOfHold);
 }
@@ -928,20 +928,34 @@ static void doAdvancePendingMode(bool firstOfHold) {
 // Board-with-no-sensor path: one continuous hold can cycle through
 // several modes, so firstOfHold tracks whether this is the first
 // advance within it (see board_s3zero.cpp for what it does with that).
+// The `% MODE_COUNT` here is the reason MODE_STORAGE sits past
+// MODE_COUNT: a hold on this board structurally cannot reach a drive it
+// has no partition for.
 static void advancePendingMode() {
-  doAdvancePendingMode(!cycledThisHold);
+  setPendingMode(static_cast<Mode>((pendingMode + 1) % MODE_COUNT),
+                 !cycledThisHold);
   cycledThisHold = true;
 }
 
-// Menu-driven path (board with a sensor): each advance is its own
-// discrete tap, not a step within a continuous hold, so there is no
-// "first of hold" to report.
-void appAdvancePendingMode() {
-  doAdvancePendingMode(false);
+// Menu-driven path (board with a sensor): the picker there cycles a list
+// that is NOT just the six modes — it carries a seventh, virtual "USB
+// DRIVE" candidate, which is the armed flag rather than a Mode (see
+// appSetStorageArmed() below) — so the board works out which candidate
+// it landed on and names it, instead of asking for "one more than
+// whatever you have". That also keeps the one place that can produce a
+// Mode value out of thin air honest: anything past the rotation is
+// refused here rather than trusted.
+//
+// Each such pick is its own discrete tap, not a step within a continuous
+// hold, so there is no "first of hold" to report.
+void appSetPendingMode(Mode mode) {
+  if (mode >= MODE_COUNT) return;  // storage is the armed flag's business, not this key's
+  setPendingMode(mode, false);
 }
 
-// The storage flag's two accessors, called by the board's USB-drive
-// picker and by the drive screen's disarm hold. They live here for the
+// The storage flag's two accessors, called by the mode picker (where
+// "USB DRIVE" is one of the candidates a tap can land on) and by the
+// drive screen's disarm hold. They live here for the
 // same reason the mode ones do: this file owns the "usbmode" namespace
 // and the question of what a reboot will come up as. Note what they do
 // NOT do — nothing about this boot changes, no device is created or torn

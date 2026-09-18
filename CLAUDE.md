@@ -96,7 +96,7 @@ a menu (AtomS3R only) is open:
 | normal | hold 1s | reset the measurement statistics | yes |
 | normal | hold 2s | open the menu (below) | yes |
 | normal | hold 3s, repeating | advance the *pending* mode, 1 of 6 (reboot to apply) | no (S3-Zero only) |
-| menu | tap | advance — move the selection, or a picker's candidate | yes |
+| menu | tap | advance — move the selection, or the mode picker's candidate | yes |
 | menu | hold 1s | trigger the highlighted item | yes |
 | auto test running | press | stop the run (and nothing else) | yes |
 | threshold cal running | press | abort it (and nothing else) | yes |
@@ -105,14 +105,19 @@ a menu (AtomS3R only) is open:
 The S3-Zero has no screen and so no menu — its button is exactly what it
 always was: press sends the action, holding cycles the pending mode every
 3s through all six. On the AtomS3R, a 2s hold from normal operation opens
-a small menu (`Light meter`, `Auto test`, `USB drive`, `Change mode`,
-`Pairing` — BLE modes only — `Exit`) that owns
+a small menu (`Light meter`, `Auto test`, `Validate`, `Sensor`,
+`Change mode`, `Pairing` — BLE modes only — `Exit`) that owns
 every subsequent press until it exits: tap cycles the highlighted item, a
 1s+ hold triggers it. `Change mode` drops into a picker where tap advances
-the candidate mode (persisting it immediately, same NVS write the
+the candidate (persisting it immediately, same NVS write the
 S3-Zero's hold-to-cycle gesture always did) and hold confirms by just
-leaving. `USB drive` drops into an identical-looking picker where tap
-toggles `ARMED`/`OFF` and hold leaves — see USB drive mode below.
+leaving. That picker's list is **seven** entries, not six: the six modes
+in rotation order, then `USB DRIVE`, then round to `GAMEPAD` again — one
+picker for the whole question "what does the next reset come up as",
+since the drive is the other answer to it (see USB drive mode below).
+Only six of the seven are a `Mode`; landing on the drive arms a flag
+instead, and landing on any real mode disarms it again — the flag wins at
+boot, so leaving it set would make the mode just picked look ignored.
 `Light meter` toggles instantly and exits; `Pairing` (BLE modes only)
 drops every bond and re-advertises, then exits; `Exit` just exits. No press
 reaches the HID/measurement path while the menu is open — see
@@ -153,7 +158,7 @@ no-flash-writes-during-a-run gotcha below, and the run-storage block in
 `board_atoms3r.cpp` for the file format.
 
 **USB drive mode** (AtomS3R only) is how those files get off the device:
-the menu's `USB drive` item arms a flag in NVS, and the *next* boot
+picking `USB DRIVE` in the mode picker arms a flag in NVS, and the *next* boot
 enumerates as a small mass-storage device — product name "USB Latency
 Tester - Storage" — whose blocks are the `ffat` partition itself, so the
 host mounts the run CSVs with no firmware in the loop. As with a pending
@@ -268,7 +273,9 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   better and silently changed what every deployed device was.
   `MODE_COUNT` grew from 3 to 6 — which is the entire change the rotation
   needed — and `MODE_STORAGE` deliberately still sits *past* it, so the
-  `% MODE_COUNT` rotation can never reach it. See the
+  `% MODE_COUNT` rotation can never reach it and it is never a stored
+  value of the mode key. The AtomS3R's picker does offer a drive as a
+  seventh candidate, but virtually, without this enum. See the
   storage-is-a-mode-but-not-in-the-rotation gotcha below.
 - `src/board.h` — the board I/O contract: `boardBegin()`,
   `boardHasSensor()`, `boardButtonPressed()`, `boardShowBoot()`,
@@ -280,8 +287,12 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   `boardShowHoldHint()`, plus the menu contract —
   `boardMenuActive()`, `boardEnterMenu()`, `boardMenuTap()`,
   `boardMenuSelect()`, and the two that run the other way —
-  `appAdvancePendingMode()` (implemented in `main.cpp`, called by the
-  board's mode-picker submenu) and `appBlePairingMode()` (likewise,
+  `appSetPendingMode(Mode)` (implemented in `main.cpp`, called by the
+  board's mode-picker submenu — it takes the mode rather than advancing
+  by one because that picker cycles a seven-entry list, six modes plus a
+  virtual `USB DRIVE`, so stepping off the drive entry has to land on
+  `MODE_GAMEPAD`; values at or past `MODE_COUNT` are refused there) and
+  `appBlePairingMode()` (likewise,
   called by the menu's BLE-only `Pairing` item). The threshold
   calibration adds three more of that second kind: `appCalPress()` /
   `appCalPressBusy()`, the one input event that flow sends to change the
@@ -703,25 +714,44 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   its `boardHasStorage()` is false, so the `new USBMSC()` is never
   reached and that env's descriptor is byte-for-byte what it was before
   any of this existed, despite `USBMSC.h` being included unconditionally.
-- **Storage is a `Mode`, but it must not be in the mode rotation — hence
-  the gap after `MODE_COUNT`.** It genuinely is an identity of its own
-  (the fourth when this was written, the seventh now):
-  fixed at boot, decided before `USB.begin()`, with its own product
-  string. So it's a `Mode`, and that is what makes it free in the press
-  path — `sendPress()`/`sendRelease()` already end in `default: break;`,
-  which is precisely "this identity sends nothing", so no new branch goes
-  into the hot path and no null HID pointer can be dereferenced. But
+- **Storage is a `Mode`, but it must not be in the mode *rotation* —
+  hence the gap after `MODE_COUNT` — even though the AtomS3R's picker
+  offers it as a seventh candidate.** Those are two different lists, and
+  keeping them apart is the whole trick. Storage genuinely is an identity
+  of its own (the fourth when this was written, the seventh now): fixed
+  at boot, decided before `USB.begin()`, with its own product string. So
+  it's a `Mode`, and that is what makes it free in the press path —
+  `sendPress()`/`sendRelease()` already end in `default: break;`, which
+  is precisely "this identity sends nothing", so no new branch goes into
+  the hot path and no null HID pointer can be dereferenced. But
   `MODE_COUNT` — 3 when this was written, 6 since the BLE modes landed —
-  bounds the rotation and `MODE_STORAGE` sits *past* it, so
+  bounds the *rotation*, and `MODE_STORAGE` sits *past* it, so
   `(pendingMode + 1) % MODE_COUNT` structurally cannot produce it however
-  the count grows: you
-  cannot hold the button into a drive, and the S3-Zero cannot reach one
-  at all. Note `MODE_COUNT` doubles as `board_atoms3r.cpp`'s "nothing
+  the count grows: the S3-Zero's hold-to-cycle gesture, which is literally
+  that expression, cannot reach a drive on a board with no partition to
+  expose. Note `MODE_COUNT` doubles as `board_atoms3r.cpp`'s "nothing
   drawn yet" sentinel, which is the other reason `MODE_STORAGE` could not
   simply *be* `MODE_COUNT`. The persisted value is separate again
   (`usbmode`/`storage`): the `mode` key must keep holding the HID
   identity to come back to, so a fourth enum value in it would have had
   nowhere to remember that.
+
+  The AtomS3R picker is the deliberate exception, and it does **not**
+  weaken any of the above, because it never touches this enum. Its list
+  is `0..MODE_COUNT` inclusive, where `MODE_COUNT` stands in for a
+  **virtual** `USB DRIVE` entry; landing there calls
+  `appSetStorageArmed(true)` and leaves `pendingMode` alone, landing on
+  any real mode calls `appSetStorageArmed(false)` and then
+  `appSetPendingMode()`. That last disarm is not cosmetic: the armed flag
+  outranks the mode key at boot, so a picked mode with the flag still set
+  would silently be ignored on the next reset. The candidate shown is
+  derived from the truth each frame (`appStorageArmed() ? drive :
+  pendingMode`) rather than tracked in a variable of its own, with the
+  same precedence boot uses, so the screen cannot drift from what a reset
+  would do. This replaced a separate `MENU_STORAGE` arm/disarm picker
+  reached from a top-level `USB drive` item — two identical-looking
+  screens answering one question ("what does the next reset come up
+  as"), which is one screen too many.
 - **Storage mode needs no special case in `main.cpp`'s loop, because it
   reuses "the menu owns the button".** A drive boot starts in a menu
   state (`MENU_DRIVE`) and never leaves it, so `boardMenuActive()` is
@@ -1079,8 +1109,12 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   alongside the validation mode) — if a measurement-path hardening ever
   looks missing, check whether it lives on an unmerged branch before
   re-deriving it.
-- **The top menu is at eight rows, its hard ceiling.** The "MENU" heading
-  went at seven items (Validate); the row pitch dropped 12px→11px at
-  eight (Sensor), putting row eight at y=85 with three clear pixels per
-  gap and the hints untouched at 96/108. There is nothing left to shave:
-  a ninth item needs a scrolling menu, not another row.
+- **The top menu peaked at eight rows, which is the hard ceiling at its
+  11px pitch; it is back to seven.** The "MENU" heading went at seven
+  items (Validate); the row pitch dropped 12px→11px at eight (Sensor),
+  putting row eight at y=85 with three clear pixels per gap and the hints
+  untouched at 96/108. `USB drive` then left the top menu for the mode
+  picker (see the storage-is-a-mode gotcha), so a BLE mode's list is
+  seven again — last row at y=74, one row of headroom. The ceiling has
+  not moved: a ninth item needs a scrolling menu, not another row, and
+  there is nothing left to shave.

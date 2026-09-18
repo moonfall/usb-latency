@@ -40,22 +40,35 @@
 //
 // MODE_STORAGE sits deliberately PAST MODE_COUNT, and the gap is the
 // whole design. MODE_COUNT is two things at once: the number of
-// identities the mode rotation cycles through, and a value no real mode
+// identities the mode ROTATION cycles through, and a value no real mode
 // ever takes (board_atoms3r.cpp uses it as its "nothing drawn yet"
-// sentinel). It grew from 3 to 6 when the BLE modes landed — which is
+// sentinel, and as the stand-in for the drive entry in its picker — see
+// below). It grew from 3 to 6 when the BLE modes landed — which is
 // exactly what puts them in the rotation and is the only change the
 // rotation needed — while `(pendingMode + 1) % MODE_COUNT` still
-// structurally cannot land on storage: you cannot hold the button into a
-// drive, and the S3-Zero, which has no storage partition at all, cannot
-// reach it even by accident. But storage IS a genuine seventh identity —
-// it enumerates as a mass-storage device, with its own product name,
-// fixed for the boot exactly like the other six — so it is a Mode and
-// not a flag hung off the side of one. That is what keeps it out of
-// main.cpp's press path for free: sendPress()/sendRelease() already end
-// in `default:`, which is precisely "this identity sends nothing".
-// What a *future* boot will be is persisted separately — see the
-// storage-armed flag in main.cpp — because that has to remember the HID
-// mode to come back to as well.
+// structurally cannot land on storage: the S3-Zero's hold-to-cycle
+// gesture, which is that expression, cannot reach a drive on a board
+// with no partition to expose. But storage IS a genuine seventh
+// identity — it enumerates as a mass-storage device, with its own
+// product name, fixed for the boot exactly like the other six — so it is
+// a Mode and not a flag hung off the side of one. That is what keeps it
+// out of main.cpp's press path for free: sendPress()/sendRelease()
+// already end in `default:`, which is precisely "this identity sends
+// nothing".
+//
+// What a *future* boot will be is persisted as TWO values, not one: the
+// mode key holds a rotation mode (0..MODE_COUNT-1) and a separate armed
+// flag says "actually, a drive" — see main.cpp. MODE_STORAGE is never
+// stored in the mode key, because that key has to go on remembering the
+// HID identity to come back out to.
+//
+// The AtomS3R's mode picker does offer all seven as one list — a tap
+// goes GAMEPAD..BLE MOUSE, then USB DRIVE, then round — but it does so
+// WITHOUT this enum: the seventh entry is virtual, the drive one is
+// arming the flag rather than choosing a Mode, and picking any real mode
+// disarms it again. So the picker's list and the rotation are two
+// different things that happen to share six of their entries, and the
+// `% MODE_COUNT` above stays exactly as unreachable as it ever was.
 enum Mode : uint8_t {
   MODE_GAMEPAD = 0,
   MODE_KEYBOARD,

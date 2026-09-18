@@ -79,7 +79,8 @@ void boardEnterMenu();
 
 // A short press-and-release while the menu is open: advance — move the
 // highlighted item, or, inside the mode-picker, advance the candidate
-// mode via appAdvancePendingMode() below.
+// identity (a Mode via appSetPendingMode() below, or the virtual "USB
+// DRIVE" candidate via appSetStorageArmed()).
 void boardMenuTap();
 
 // A hold of a second or more while the menu is open: trigger the
@@ -163,16 +164,26 @@ void appBlePairingMode();
 // firstOfHold is true only for the first advance within a given hold, for
 // boards that want a one-off "something changed" cue before settling into
 // showing the new pending mode. Always false when driven by the menu's
-// mode picker (appAdvancePendingMode()) — a discrete tap, not a hold, so
+// mode picker (appSetPendingMode()) — a discrete tap, not a hold, so
 // "first within a hold" doesn't apply there.
 void boardShowPending(Mode active, Mode pending, bool firstOfHold);
 
 // Implemented in main.cpp; called by the board's mode-picker submenu on
-// each advancing tap. Advances and persists pendingMode exactly as the
-// S3-Zero's hold-to-cycle gesture always has, and reports the result
-// back through boardShowPending() above so the picker can show it. A
-// board with no menu never calls this.
-void appAdvancePendingMode();
+// each advancing tap. Persists pendingMode — the same NVS write the
+// S3-Zero's hold-to-cycle gesture has always done — and reports the
+// result back through boardShowPending() above so the picker can show
+// it. A board with no menu never calls this.
+//
+// It takes the mode rather than advancing by one because the picker's
+// list is not the mode rotation: it cycles the six modes AND a seventh,
+// virtual "USB DRIVE" candidate that is the storage-armed flag, not a
+// Mode (see appSetStorageArmed() below and the MODE_STORAGE comment in
+// mode.h). Stepping off that seventh entry has to land on MODE_GAMEPAD,
+// which "one past whatever pendingMode happens to be" cannot express —
+// the board knows where it is in its own list, so it says so. Values at
+// or past MODE_COUNT are refused: this key holds a rotation mode and
+// nothing else.
+void appSetPendingMode(Mode mode);
 
 // Implemented in main.cpp; called by the menu's "Auto test" item. Starts
 // an unattended run of AUTO_TEST_ITERATIONS presses in the current mode,
@@ -325,8 +336,11 @@ void boardShowStorageEjected();
 // that has to go on remembering which HID identity to come back to, so
 // two values were needed either way.
 //
-// Called from the board's menu, both ways: to arm a drive from an
-// ordinary boot, and to disarm one from the drive screen itself.
+// Called from the board's menu, both ways: to arm a drive from the mode
+// picker on an ordinary boot (where "USB DRIVE" is the candidate after
+// the last real mode, and picking any real mode disarms again — the flag
+// wins at boot, so leaving it set would make the picked mode look
+// ignored), and to disarm one from the drive screen itself.
 void appSetStorageArmed(bool armed);
 bool appStorageArmed();
 

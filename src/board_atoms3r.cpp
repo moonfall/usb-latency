@@ -77,14 +77,14 @@
  * (see board.h for the full normal/menu button contract — this file just
  * implements it):
  *
- *      MENU                    MENU_TOP: five items, or six in a BLE
- *    > Light meter              mode, cycled by tap and triggered by a
- *      Auto test                1s+ hold. Light meter flips meterView
- *      USB drive                and exits; Auto test and Pairing hand
- *      Change mode              off to main.cpp (which owns USB and the
- *      Pairing                  radio, so it owns both) and exit; USB
- *      Exit                     drive and Change mode drop into the two
- *   tap: next  hold: select     pickers below; Exit just leaves.
+ *      MENU                    MENU_TOP: the items of this boot, cycled
+ *    > Light meter              by tap and triggered by a 1s+ hold.
+ *      Auto test                Light meter flips meterView and exits;
+ *      Change mode              Auto test and Pairing hand off to
+ *      Pairing                  main.cpp (which owns USB and the radio,
+ *      Exit                     so it owns both) and exit; Change mode
+ *   tap: next  hold: select     drops into the picker below; Exit just
+ *                               leaves.
  *
  *                               Pairing exists only in a BLE mode — see
  *                               buildTopMenu() below, and
@@ -94,19 +94,21 @@
  *                               the list, so it cannot be cycled past
  *                               either.
  *
- *   CHANGE MODE                MENU_MODE: tap advances the candidate via
- *     KEYBOARD                  appAdvancePendingMode() — the same NVS
+ *   CHANGE MODE                MENU_MODE: tap advances the candidate and
+ *     KEYBOARD                  persists it on the spot — the same NVS
  *   on next reset                write the old hold-to-cycle gesture did,
  *   tap: next  hold: confirm    just tap-driven now. Hold exits the menu;
  *                                the choice is already persisted per tap,
  *                                so there is nothing left to "confirm".
  *
- *   USB DRIVE                  MENU_STORAGE: the same shape again, for
- *     ARMED                     the one thing that is not a Mode you can
- *   on next reset                cycle to — tap toggles whether the next
- *   tap: toggle  hold: done      boot enumerates as a mass-storage device
- *                                instead of a HID one (persisted per tap
- *                                via appSetStorageArmed()), hold leaves.
+ *                               The list is the six modes plus USB DRIVE
+ *                                — one picker for "what does the next
+ *                                reset come up as", which is the actual
+ *                                question, rather than one picker for the
+ *                                six and a second for the seventh. Only
+ *                                six of the seven are a Mode; the drive
+ *                                is the armed flag instead (see
+ *                                pickerCandidate() below).
  *
  * While the menu is open, no press reaches the HID/measurement path at
  * all (see main.cpp) — every press is menu input until MENU_TOP's Exit,
@@ -434,7 +436,7 @@ static volatile uint16_t autoTotal = 0;
 // menu state for the same reason MENU_DRIVE is one: while it is up,
 // boardMenuActive() keeps every press (the continue tap, the dismissing
 // tap, anything stray mid-capture) from also being a HID press.
-enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_STORAGE, MENU_DRIVE, MENU_CAPTURE, MENU_VAL, MENU_SENSOR };
+enum MenuState : uint8_t { MENU_NONE, MENU_TOP, MENU_MODE, MENU_DRIVE, MENU_CAPTURE, MENU_VAL, MENU_SENSOR };
 static volatile MenuState menuState = MENU_NONE;
 static int topIndex = 0;
 
@@ -449,14 +451,13 @@ enum TopItem : uint8_t {
   ITEM_AUTO,
   ITEM_VALIDATE,
   ITEM_SENSOR,
-  ITEM_DRIVE,
   ITEM_MODE,
   ITEM_PAIR,   // BLE modes only
   ITEM_EXIT,
   ITEM_KINDS,
 };
 static const char *TOP_ITEM_LABELS[ITEM_KINDS] = {
-  "Light meter", "Auto test", "Validate", "Sensor", "USB drive", "Change mode", "Pairing", "Exit"
+  "Light meter", "Auto test", "Validate", "Sensor", "Change mode", "Pairing", "Exit"
 };
 // Built once per boot by buildTopMenu(), from the mode. Fixed for the
 // life of the boot, exactly like the mode it is derived from, so nothing
@@ -937,12 +938,13 @@ static void drawMenuTop() {
   display.setFont(&fonts::Font0);
   display.setTextDatum(textdatum_t::top_center);
 
-  // Eight items (a BLE mode's list, Validate and Sensor included) at
-  // 11px pitch from y=8 put the eighth row at y=85, Font0's 8px leaving
-  // three clear pixels per gap and the hints untouched at 96/108. The
-  // "MENU" heading went at seven items; the gap between rows went from
-  // four pixels to three at eight. THIS is genuinely the panel full: a
-  // ninth item needs a scrolling menu — there is nothing left to shave.
+  // Seven items at most now (a BLE mode's list, Validate and Sensor
+  // included) — USB drive left for the mode picker, which is where the
+  // question it answers actually belongs. The 11px pitch from y=8 is
+  // what eight rows needed, so seven sit inside it with a row to spare:
+  // the seventh lands at y=74, Font0's 8px leaving three clear pixels
+  // per gap and the hints untouched at 96/108. Eight rows (y=85) is
+  // still the ceiling at this pitch; a ninth needs a scrolling menu.
   const int rowH = 11;
   const int top = 8;
   char buf[24];
@@ -962,13 +964,34 @@ static void drawMenuTop() {
   display.drawString("hold: select", SCREEN_W / 2, 108);
 }
 
-// MENU_MODE: the mode picker. pendingMode is the candidate a tap here
-// advances (via appAdvancePendingMode(), which persists it immediately —
+// MENU_MODE: the picker for "what does the next reset come up as". Its
+// list is the six rotation modes plus one virtual seventh entry, USB
+// DRIVE — which is not a Mode the mode key can hold (see mode.h on why
+// MODE_STORAGE sits past MODE_COUNT) but is the other thing a reset can
+// produce, so it belongs in the same list rather than behind a second,
+// identical-looking picker of its own. MODE_COUNT stands in for that
+// entry here: it is already the value no real mode takes, which keeps
+// the list a plain 0..MODE_COUNT range.
+static const int PICK_DRIVE = MODE_COUNT;
+
+// Where the picker is currently sitting — derived from the truth every
+// time rather than tracked in a variable of its own, so the screen
+// cannot drift from what a reset would actually do. The precedence is
+// boot's: the armed flag outranks pendingMode (main.cpp ignores the mode
+// key entirely on a drive boot), so an armed drive IS the candidate,
+// whatever pendingMode still remembers.
+static int pickerCandidate(Mode pending) {
+  return appStorageArmed() ? PICK_DRIVE : (int)pending;
+}
+
+// A tap advances that candidate, persisting the result immediately —
 // there is nothing left for the hold to "confirm" beyond leaving the
-// menu), shown big and in its own colour, same as the old headline used
-// to be for the active mode.
+// menu. The candidate is shown big and in its own colour, same as the
+// old headline used to be for the active mode.
 static void drawMenuMode(Mode active, Mode pending) {
   uint16_t dim = dimColor();
+  bool drive = (pickerCandidate(pending) == PICK_DRIVE);
+  const char *name = drive ? "USB DRIVE" : modeName(pending);
 
   display.setFont(&fonts::Font0);
   display.setTextDatum(textdatum_t::top_center);
@@ -976,58 +999,27 @@ static void drawMenuMode(Mode active, Mode pending) {
   display.drawString("CHANGE MODE", SCREEN_W / 2, 6);
 
   display.setTextDatum(textdatum_t::middle_center);
-  display.setTextColor(modeColor(pending), black());
+  // Amber for the drive, matching the "-> USB DRIVE" the normal screen's
+  // next line shows for the same state; the six modes keep their own
+  // colours.
+  display.setTextColor(drive ? display.color565(255, 190, 40) : modeColor(pending),
+                       black());
   display.setFont(&fonts::Font4);
-  if (display.textWidth(modeName(pending)) > SCREEN_W - 8) {
+  if (display.textWidth(name) > SCREEN_W - 8) {
     display.setFont(&fonts::Font2);
   }
-  display.drawString(modeName(pending), SCREEN_W / 2, 52);
+  display.drawString(name, SCREEN_W / 2, 52);
 
   display.setFont(&fonts::Font0);
   display.setTextDatum(textdatum_t::top_center);
   display.setTextColor(dim, black());
-  if (pending != active) {
+  // An armed drive is an "on next reset" condition in its own right —
+  // pendingMode can equal activeMode and the next boot still be a drive.
+  if (drive || pending != active) {
     display.drawString("on next reset", SCREEN_W / 2, 76);
   }
   display.drawString("tap: next", SCREEN_W / 2, 96);
   display.drawString("hold: confirm", SCREEN_W / 2, 108);
-}
-
-// MENU_STORAGE: the arm/disarm picker, deliberately built to the same
-// pattern as drawMenuMode() above — a big candidate, "on next reset"
-// underneath it, and a tap that persists immediately so the hold has
-// nothing left to do but leave. Storage is not a Mode you can cycle to
-// (see mode.h on why MODE_STORAGE sits outside the rotation), so it needs
-// its own picker; making that picker look and behave identically is the
-// next best thing to it being one.
-static void drawMenuStorage(Mode pending) {
-  uint16_t dim = dimColor();
-  bool armed = appStorageArmed();
-
-  display.setFont(&fonts::Font0);
-  display.setTextDatum(textdatum_t::top_center);
-  display.setTextColor(dim, black());
-  display.drawString("USB DRIVE", SCREEN_W / 2, 6);
-
-  display.setTextDatum(textdatum_t::middle_center);
-  display.setFont(&fonts::Font4);
-  display.setTextColor(armed ? display.color565(255, 190, 40) : dim, black());
-  display.drawString(armed ? "ARMED" : "OFF", SCREEN_W / 2, 52);
-
-  display.setFont(&fonts::Font0);
-  display.setTextDatum(textdatum_t::top_center);
-  display.setTextColor(dim, black());
-  if (armed) {
-    display.drawString("on next reset", SCREEN_W / 2, 76);
-  } else {
-    // Say what it falls back to, so the two lines answer the same
-    // question ("what will the next reset be?") either way round.
-    char buf[24];
-    snprintf(buf, sizeof(buf), "stays %s", modeName(pending));
-    display.drawString(buf, SCREEN_W / 2, 76);
-  }
-  display.drawString("tap: toggle", SCREEN_W / 2, 96);
-  display.drawString("hold: done", SCREEN_W / 2, 108);
 }
 
 // MENU_DRIVE: the entire UI of a MODE_STORAGE boot. No items, no way out
@@ -1646,8 +1638,6 @@ static void drawFrame(Mode active, Mode pending, int raw, uint32_t mv, HoldRung 
     drawMenuTop();
   } else if (menuState == MENU_MODE) {
     drawMenuMode(active, pending);
-  } else if (menuState == MENU_STORAGE) {
-    drawMenuStorage(pending);
   } else if (menuState == MENU_DRIVE) {
     drawMenuDrive(pending);
   } else if (menuState == MENU_CAPTURE) {
@@ -1768,11 +1758,21 @@ static void uiTaskFn(void *) {
       if (menuState == MENU_TOP) {
         topIndex = (topIndex + 1) % numTopItems;
       } else if (menuState == MENU_MODE) {
-        appAdvancePendingMode();
-      } else if (menuState == MENU_STORAGE) {
-        // Persisted on the spot, exactly like the mode picker's tap —
-        // so the hold that follows is only ever "I'm done looking".
-        appSetStorageArmed(!appStorageArmed());
+        // One list, two kinds of thing: the six modes in rotation order,
+        // then USB DRIVE, then round to the first mode again.
+        int cand = (pickerCandidate(pending) + 1) % (PICK_DRIVE + 1);
+        if (cand == PICK_DRIVE) {
+          // pendingMode is deliberately left where it was. It is
+          // irrelevant while the drive is armed (boot ignores it), and
+          // it is what the drive screen offers as the way back out.
+          appSetStorageArmed(true);
+        } else {
+          // Picking a real mode MUST disarm: the armed flag wins at
+          // boot, so leaving it set would make the mode just chosen look
+          // ignored on the next reset.
+          if (appStorageArmed()) appSetStorageArmed(false);
+          appSetPendingMode((Mode)cand);
+        }
       } else if (menuState == MENU_SENSOR) {
         // Applied and persisted per tap, same idiom as the other
         // pickers. Stats go with the old sensor — one circuit's numbers
@@ -1847,7 +1847,6 @@ static void uiTaskFn(void *) {
             menuState = MENU_NONE;
             break;
           case ITEM_SENSOR: menuState = MENU_SENSOR; break;
-          case ITEM_DRIVE: menuState = MENU_STORAGE; break;
           case ITEM_MODE:  menuState = MENU_MODE; break;
           // Pairing has no picker of its own and nothing to confirm: it
           // is a single irreversible-ish act (bonds gone, advertising
@@ -1861,10 +1860,10 @@ static void uiTaskFn(void *) {
           case ITEM_EXIT:  menuState = MENU_NONE; break;
           default: break;
         }
-      } else if (menuState == MENU_MODE || menuState == MENU_STORAGE ||
-                 menuState == MENU_VAL || menuState == MENU_SENSOR) {
+      } else if (menuState == MENU_MODE || menuState == MENU_VAL ||
+                 menuState == MENU_SENSOR) {
         // The pickers persist per tap and the validation report is only
-        // a report — in all four, a hold just leaves.
+        // a report — in all three, a hold just leaves.
         menuState = MENU_NONE;
       } else if (menuState == MENU_CAPTURE) {
         // On the report, hold means "use it": the calibrated threshold
@@ -1898,8 +1897,11 @@ static void uiTaskFn(void *) {
     LinkState link = wantLink;  // see the note where the others are read
 
     bool inMenu = (menuState != MENU_NONE);
-    bool storageScreen = (menuState == MENU_STORAGE || menuState == MENU_DRIVE);
-    bool armed = storageScreen && appStorageArmed();
+    // Tracked unconditionally: the armed flag is now visible on three
+    // screens — the mode picker (as its seventh candidate), the drive
+    // screen, and the normal screen's next line ("-> USB DRIVE") — so
+    // "which screen are we on" is no longer a useful filter on it.
+    bool armed = appStorageArmed();
     bool ejected = storageEjected;
     bool newFrame = (active != shownActive || pending != shownPending ||
                      meterView != shownMeter ||
@@ -2286,16 +2288,16 @@ bool boardButtonPressed() {
 //
 // Pairing is in only in a BLE mode. Not greyed out, not present-but-inert
 // — absent, so tapping through the menu in a USB mode is exactly the menu
-// it always was. Nothing else is conditional: USB drive and Auto test are
-// as useful over the radio as over the wire, which is rather the point of
-// having BLE modes at all.
+// it always was. Nothing else is conditional: Auto test and the mode
+// picker (whose list carries the USB drive) are as useful over the radio
+// as over the wire, which is rather the point of having BLE modes at
+// all.
 static void buildTopMenu(Mode active) {
   numTopItems = 0;
   topItems[numTopItems++] = ITEM_METER;
   topItems[numTopItems++] = ITEM_AUTO;
   topItems[numTopItems++] = ITEM_VALIDATE;
   topItems[numTopItems++] = ITEM_SENSOR;
-  topItems[numTopItems++] = ITEM_DRIVE;
   topItems[numTopItems++] = ITEM_MODE;
   if (modeIsBle(active)) topItems[numTopItems++] = ITEM_PAIR;
   topItems[numTopItems++] = ITEM_EXIT;
