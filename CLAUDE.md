@@ -1181,7 +1181,18 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   HID boot). Each step's CSV carries `# fulltest,<id>` and
   `# fullstep,<k>/<6>` — membership is captured at run START, so a file
   written after an abort still says which test it belonged to; the
-  analyzer ignores unknown `#` lines by construction. The menu item sits
+  analyzer ignores unknown `#` lines by construction. **The start is a
+  request flag consumed on core 1** (`fullStartRequested`), and this was
+  learned the hard way, on hardware: the first version did the setup
+  directly in `appStartFullTest()` — which runs on core 0, from the
+  menu's select handler — and set `fullPhase = FULL_RUNNING` microseconds
+  before `autoStartRequested`. Core 1's refused-start detector fired in
+  that window on effectively every attempt, silently self-aborting the
+  test; the symptom was "ran one auto test in the current mode, wrote an
+  UNTAGGED csv, never rebooted". The rule it reinforces: anything the
+  board's UI task asks main.cpp to do must be a flag main.cpp's core
+  consumes, never state written from the other core — same idiom as
+  `autoStartRequested` and the menu request flags. The menu item sits
   BELOW Exit on purpose: a ~15-minute six-reboot run is the last thing a
   stray extra tap should land on, and it put the menu back at eight rows
   / 11px pitch (see the ceiling gotcha).

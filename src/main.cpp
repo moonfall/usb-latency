@@ -1130,24 +1130,21 @@ static void fullAbort() {
   boardShowFullTest(0, 0);
 }
 
+// Raise-a-flag only, because this is called from the board's UI task on
+// CORE 0 and everything the full test owns lives on core 1. The first
+// version of this function did the setup right here, and lost the race
+// it created: it set fullPhase = FULL_RUNNING several microseconds
+// before autoStartRequested, and core 1's refused-start detector — which
+// treats "FULL_RUNNING with no run active, requested, or ever started"
+// as a failed start — fired in that window on effectively every attempt,
+// silently self-aborting the test and letting the first run proceed as a
+// plain standalone auto test. The request-flag idiom the rest of the
+// codebase uses for cross-core commands exists precisely to make that
+// window impossible: core 1 does the whole setup in one pass of its own.
+static volatile bool fullStartRequested = false;
+
 void appStartFullTest() {
-  if (autoPhase != AUTO_OFF || fullPhase != FULL_OFF) return;  // one at a time
-  // An armed USB-drive flag would hijack the first reboot into a
-  // storage boot and strand the test — full test and drive arming are
-  // mutually exclusive by construction.
-  appSetStorageArmed(false);
-  fullStart = (uint8_t)activeMode;
-  fullStep = 0;
-  fullId = prefs.getUInt(PREFS_FULL_ID_KEY, 0) + 1;
-  prefs.putUInt(PREFS_FULL_ID_KEY, fullId);
-  prefs.putUChar(PREFS_FULL_START_KEY, fullStart);
-  prefs.putUChar(PREFS_FULL_STEP_KEY, 0);
-  fullConsecTimeouts = 0;
-  fullRunStarted = false;
-  fullPhase = FULL_RUNNING;   // step 0 runs in the current boot, no reboot needed
-  boardShowFullTest(1, FULL_TEST_STEPS);
-  autoIsValidation = false;
-  autoStartRequested = true;
+  fullStartRequested = true;
 }
 
 // The full test's own pacing, called every loop() pass after
@@ -1155,6 +1152,31 @@ void appStartFullTest() {
 // after a boot, noticing a step's run finishing, and the reboot into the
 // next mode.
 static void serviceFullTest(uint32_t now) {
+  // The start request, deferred here from appStartFullTest() (core 0) so
+  // every write below happens on this core, in this pass, with no window
+  // in which the state machine is half-armed — see the comment there.
+  if (fullStartRequested) {
+    fullStartRequested = false;
+    if (fullPhase == FULL_OFF && autoPhase == AUTO_OFF && !autoStartRequested) {
+      // An armed USB-drive flag would hijack the first reboot into a
+      // storage boot and strand the test — full test and drive arming
+      // are mutually exclusive by construction.
+      appSetStorageArmed(false);
+      fullStart = (uint8_t)activeMode;
+      fullStep = 0;
+      fullId = prefs.getUInt(PREFS_FULL_ID_KEY, 0) + 1;
+      prefs.putUInt(PREFS_FULL_ID_KEY, fullId);
+      prefs.putUChar(PREFS_FULL_START_KEY, fullStart);
+      prefs.putUChar(PREFS_FULL_STEP_KEY, 0);
+      fullConsecTimeouts = 0;
+      fullRunStarted = false;
+      autoIsValidation = false;
+      autoStartRequested = true;
+      fullPhase = FULL_RUNNING;  // step 0 runs in the current boot, no reboot needed
+      boardShowFullTest(1, FULL_TEST_STEPS);
+    }
+  }
+
   switch (fullPhase) {
     case FULL_OFF:
       return;
