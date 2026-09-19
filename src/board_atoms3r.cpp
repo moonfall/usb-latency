@@ -331,7 +331,31 @@ static const uint32_t MEASURE_TIMEOUT_MS = 500;
 // tept4400 branch — the fast-detection complaints that led to the
 // validation mode were, in part, this fix being missing. It is
 // deliberately part of main again now.
-static const int MEASURE_CONFIRM = 3;
+// Raised 3 -> 10 (and made tunable) after impossibly short measurements
+// survived 3: at ~30us a sample, three consecutive reads span ~100us,
+// which fits comfortably inside a single backlight-PWM dwell or any
+// flicker half-period — 3 confirms noise as happily as signal. Ten spans
+// several hundred microseconds. The reported time is still the FIRST
+// sample of the confirmed run, so raising this adds certainty, never
+// latency.
+#ifndef MEASURE_CONFIRM
+#define MEASURE_CONFIRM 10
+#endif
+
+// How many CONSECUTIVE same-side samples establish the baseline (and so
+// the crossing direction) at the start of a measurement. Consecutive,
+// not averaged, and that distinction is the whole fix: the previous
+// 4-sample AVERAGE, fed flicker that straddles the threshold, lands
+// mid-band and coin-flips the direction call — and a wrong direction
+// makes every subsequent stable sample a "crossing", confirmed in
+// ~100us: exactly the impossibly short measurements observed. N
+// consecutive same-side samples prove the light is actually sitting on
+// one side; an average proves nothing of the sort. If the light never
+// holds still long enough to settle, no direction can honestly be
+// inferred and the measurement times out rather than guessing.
+#ifndef BASELINE_CONFIRM
+#define BASELINE_CONFIRM 10
+#endif
 
 // How many of the most recent samples, per direction, the histogram is
 // built from. Override with -DHIST_CAPACITY=<n> if 500 is more or less
@@ -624,16 +648,51 @@ static uint16_t linkColor(LinkState link) {
 // MEASURE_TIMEOUT_MS bounds how long core 0's idle task goes unserviced.
 // loop() is on core 1 and is untouched throughout; the USB task sits at a
 // higher priority and still preempts this freely.
+// Establish the pre-change side of the threshold — and with it the
+// direction the measurement waits for — by demanding BASELINE_CONFIRM
+// consecutive same-side samples (see that constant for why consecutive
+// beats averaged). Returns false if the deadline passes first: the light
+// never held still, so no direction can honestly be inferred. waitForRise
+// is set either way — on failure from the last side observed, which is
+// the closest thing to truth a timeout row's direction column can carry.
+//
+// Timing: ten consecutive samples settle in a few hundred microseconds
+// against a steady display, while the change being measured is >= 8ms
+// away (one USB poll at minimum) — so settling cannot miss the real
+// crossing. If flicker delays settling PAST the real change, the
+// inherited direction points away from the new state and the measurement
+// times out: recorded, honest, and better than a fabricated number.
+// Tight-poll licence is the caller's (bounded by the same deadline).
+static bool settleBaseline(int64_t deadline, bool &waitForRise) {
+  int side = -1;
+  int run = 0;
+  for (;;) {
+    int v = analogRead(sensorPin());
+    int cur = (v >= lightThreshold) ? 1 : 0;
+    if (cur == side) {
+      if (++run >= BASELINE_CONFIRM) {
+        waitForRise = (side == 0);
+        return true;
+      }
+    } else {
+      side = cur;
+      run = 1;
+    }
+    if (esp_timer_get_time() >= deadline) {
+      waitForRise = (side == 0);
+      return false;
+    }
+  }
+}
+
 static void runMeasurement(int64_t t0) {
-  // Averaged baseline: a single read sits within ADC noise of a low
-  // threshold, and a noise-displaced baseline picks the wrong crossing
-  // direction. ~100us of reads, none of it in the reported figure — t0
-  // is already fixed.
-  int32_t baselineSum = 0;
-  for (int i = 0; i < 4; i++) baselineSum += analogRead(sensorPin());
-  int baseline = baselineSum / 4;
-  bool waitForRise = baseline < lightThreshold;
   int64_t deadline = t0 + (int64_t)MEASURE_TIMEOUT_MS * 1000;
+  bool waitForRise;
+  if (!settleBaseline(deadline, waitForRise)) {
+    lastLatencyUs = LAT_TIMEOUT;
+    appRecordSample(0, waitForRise, true);
+    return;
+  }
 
   // A crossing counts only after MEASURE_CONFIRM consecutive agreeing
   // reads — but the reported time is the FIRST read of the run, so the
@@ -1439,11 +1498,17 @@ static void runValidatedMeasurement(int64_t t0) {
   val.flipsSincePress = 0;
   val.presses++;
 
-  int32_t baselineSum = 0;
-  for (int i = 0; i < 4; i++) baselineSum += analogRead(sensorPin());
-  int baseline = baselineSum / 4;
-  bool waitForRise = baseline < lightThreshold;
   int64_t deadline = t0 + (int64_t)MEASURE_TIMEOUT_MS * 1000;
+  bool waitForRise;
+  if (!settleBaseline(deadline, waitForRise)) {
+    // The light never sat still long enough to name a starting side —
+    // for the validation's purposes that IS the finding, counted as a
+    // timeout (and the idle watcher has usually been saying the same
+    // thing in flips).
+    val.timeouts++;
+    valIdleSide = -1;
+    return;
+  }
 
   int64_t crossAt = 0;
   int run = 0;

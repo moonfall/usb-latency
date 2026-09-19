@@ -1105,11 +1105,10 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   outranking everything — unrequested changes make every other number
   unreliable.
 - **The false-trigger protections were LOST for a while — shelving the
-  TEPT4400 branch took them with it.** `MEASURE_CONFIRM` (3 consecutive
+  TEPT4400 branch took them with it.** `MEASURE_CONFIRM` (consecutive
   agreeing samples per crossing, clock stopped at the run's first
-  sample) and the 4-read averaged baseline were added to
-  `runMeasurement()` in the SFH309 era — on what became the tept4400
-  branch. When that branch was shelved, main's `runMeasurement()`
+  sample) and an averaged baseline were added to `runMeasurement()` in
+  the SFH309 era — on what became the tept4400 branch. When that branch was shelved, main's `runMeasurement()`
   silently reverted to single-read baseline and single-sample crossings,
   and the impossibly-fast detections duly returned with the next
   low-margin sensor. Both protections are back in main (restored
@@ -1218,3 +1217,25 @@ pio run -e <env> -t upload            # flash (see esptool gotcha below)
   the link finally tears down, re-creating a bond entry after the wipe.
   `onDisconnect` now sweeps again if the pairing gesture is still armed
   when a link dies.
+- **The baseline demands BASELINE_CONFIRM consecutive same-side samples
+  — an averaged baseline coin-flips the direction against flicker, and
+  that was the remaining source of impossibly short measurements.** The
+  mechanism, in full: feed a 4-sample average light that flickers across
+  the threshold and the average lands mid-band, so which side it falls
+  on — and therefore which crossing direction the measurement waits
+  for — is a coin flip. Called wrong, every subsequent *stable* sample
+  reads as "crossed", the old MEASURE_CONFIRM=3 confirmed it in ~100µs,
+  and the result was a sub-millisecond measurement that survived every
+  other guard. `settleBaseline()` (shared by the normal and validated
+  measurement paths) instead requires `BASELINE_CONFIRM` (10)
+  consecutive samples on ONE side: consistency proves the light is
+  sitting somewhere; an average proves nothing. If it never settles
+  before the measurement deadline, the row is a timeout — no direction
+  can honestly be inferred, and refusing beats fabricating.
+  `MEASURE_CONFIRM` also rose 3→10 (both are `#ifndef`-tunable): three
+  samples span ~100µs, inside a single backlight-PWM dwell, so three
+  confirmed flicker as happily as signal; the first-sample timestamping
+  means raising it adds certainty, never reported latency. Settling
+  takes a few hundred µs against a steady display while the real change
+  is ≥8ms away, so it cannot miss a genuine crossing; if flicker delays
+  settling past the change, the measurement times out honestly.
